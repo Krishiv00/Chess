@@ -343,7 +343,7 @@ void Application::HandleKeyPressed(sf::Keyboard::Scancode key) {
     if (key == sf::Keyboard::Scancode::V) {
         if (sf::Keyboard::isKeyPressed(sf::Keyboard::Scancode::LControl)) {
             m_PromotionSelectionActive = false;
-            loadFen(sf::Clipboard::getString());
+            loadFen(sf::Clipboard::getString().toAnsiString());
         }
     }
 
