@@ -140,7 +140,5 @@ clean:
 	@echo Cleaning $(BUILD_DIR)/ and $(OUT_DIR)/
 	@if exist "$(BUILD_DIR)" rmdir /S /Q "$(BUILD_DIR)"
 	@if exist "$(OUT_DIR)" rmdir /S /Q "$(OUT_DIR)"
-	@if exist "$(GUI_EXE)" del /Q "$(GUI_EXE)"
-	@if exist "$(UCI_EXE)" del /Q "$(UCI_EXE)"
 
 -include $(GUI_DEV_OBJ:.o=.d) $(UCI_DEV_OBJ:.o=.d)
