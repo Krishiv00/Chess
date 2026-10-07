@@ -334,6 +334,11 @@ bool Application::LoadResources(const std::filesystem::path& root) {
         return false;
     }
 
+    if (!m_SfxPlayer.LoadFromFile(Sfx::Illegal, soundPath / "Illegal.wav")) [[unlikely]] {
+        std::cerr << "Failed to load sound" << std::endl;
+        return false;
+    }
+
     if (!m_SfxPlayer.LoadFromFile(Sfx::SpecialMove, soundPath / "Special Move.wav")) [[unlikely]] {
         std::cerr << "Failed to load sound" << std::endl;
         return false;
@@ -682,6 +687,8 @@ void Application::dropPiece(int idx, bool animate) {
         doMove(*it, animate);
 
         if (!m_GameOver && !m_InspectionMode) pollEngineMove();
+    } else if (idx != m_SelectedPiece) {
+        m_SfxPlayer.Play(Sfx::Illegal);
     }
 
     m_SelectedPiece = Chess::NullPos;

@@ -232,6 +232,7 @@ Resources/
     ├── Move Self.wav
     ├── Notify.wav
     ├── Promotion.wav
+    ├── Illegal.wav
     └── Special Move.wav
 ```
 

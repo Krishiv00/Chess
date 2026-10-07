@@ -14,6 +14,7 @@ enum class Sfx {
     MoveSelf,
     MoveOpponent,
     SpecialMove,
+    Illegal,
     Count
 };
 
@@ -28,13 +29,13 @@ public:
         const std::size_t index = static_cast<std::size_t>(sfx);
 
         sf::SoundBuffer& buffer = m_Buffers[index];
-    
+
         if (!buffer.loadFromFile(filepath)) [[unlikely]] {
             return false;
         }
-    
+
         m_Sounds[index].emplace(buffer);
-    
+
         return true;
     }
 
