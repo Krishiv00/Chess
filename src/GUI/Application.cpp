@@ -88,9 +88,15 @@ void Application::SetTargetSize(sf::Vector2u size) {
         buttonSize, buttonSize,
         1,
         [this](ButtonPanel::Button&) -> void {
-            if (!m_EngineThinking && !m_GameOver) pollEngineMove();
+            if (m_EngineThinking || m_GameOver) return;
+
+            if (sf::Keyboard::isKeyPressed(sf::Keyboard::Scancode::LControl)) {
+                pollEngineMove(true);
+            } else {
+                pollEngineMove();
+            }
         },
-        std::array<std::string, 2>{"Play Best Move", ""}
+        std::array<std::string, 2>{"Play Best Move", "Suggest Best Move"}
     ));
 
     currentYPos += buttonSize + padding_y * 2.f;
@@ -396,30 +402,45 @@ void Application::HandleMouseButtonReleased(sf::Mouse::Button button, sf::Vector
         if (m_CurrentlyDrawingArrow.Start == m_CurrentlyDrawingArrow.End) {
             m_Markers ^= Chess::IndexToMask(idx); // toggle marker
         } else if (m_CurrentlyDrawingArrow) {
-            auto it = std::find_if(m_Arrows.begin(), m_Arrows.end(),
-                [this](const Arrow& arrow) -> bool {
-                    return (
-                        arrow.Start == m_CurrentlyDrawingArrow.Start && arrow.End == m_CurrentlyDrawingArrow.End
-                    );
-                }
-            );
-
-            if (it != m_Arrows.end()) {
-                m_Arrows.erase(it);
-            } else {
-                m_Arrows.push_back(m_CurrentlyDrawingArrow);
-            }
-
-            m_Markers |= (
-                // enable start
-                Chess::IndexToMask(m_CurrentlyDrawingArrow.Start) |
-                // enable end
-                Chess::IndexToMask(m_CurrentlyDrawingArrow.End)
-            );
+            toggleArrow(m_CurrentlyDrawingArrow.Start, m_CurrentlyDrawingArrow.End);
         }
 
         m_CurrentlyDrawingArrow = Arrow();
     }
+}
+
+std::vector<Arrow>::iterator Application::findArrow(uint8_t start, uint8_t end) {
+    return std::find_if(m_Arrows.begin(), m_Arrows.end(),
+        [start, end](const Arrow& existing) -> bool {
+            return existing.Start == start && existing.End == end;
+        }
+    );
+}
+
+void Application::toggleArrow(uint8_t start, uint8_t end) {
+    auto it = findArrow(start, end);
+
+    if (it != m_Arrows.end()) {
+        m_Arrows.erase(it);
+    } else {
+        m_Arrows.push_back(Arrow{start, end});
+    }
+
+    m_Markers |= (
+        Chess::IndexToMask(start) |
+        Chess::IndexToMask(end)
+    );
+}
+
+void Application::addArrow(uint8_t start, uint8_t end) {
+    if (findArrow(start, end) != m_Arrows.end()) return;
+
+    m_Arrows.push_back(Arrow{start, end});
+
+    m_Markers |= (
+        Chess::IndexToMask(start) |
+        Chess::IndexToMask(end)
+    );
 }
 
 void Application::HandleMouseMoved(sf::Vector2i position) {
@@ -500,7 +521,7 @@ int Application::hitTestPromotionMenu(sf::Vector2i mousePos) const {
 
 #pragma region Gameplay
 
-void Application::pollEngineMove() {
+void Application::pollEngineMove(bool suggestOnly) {
     // return;
 
     if (m_GameOver || m_EngineThinking) return;
@@ -508,6 +529,7 @@ void Application::pollEngineMove() {
     joinThreads();
 
     m_EngineThinking = true;
+    m_SuggestingMove = suggestOnly;
 
     m_Board.SetEngineColor(m_SideToMove);
 
@@ -695,9 +717,14 @@ void Application::stopPonder() {
 
 void Application::Update(float deltaTime) {
     if (m_PendingEngineMove) {
-        doMove(m_PendingEngineMove, true);
-        startPonder();
+        if (m_SuggestingMove) {
+            addArrow(m_PendingEngineMove.StartingSquare, m_PendingEngineMove.TargetSquare);
+        } else {
+            doMove(m_PendingEngineMove, true);
+            startPonder();
+        }
 
+        m_SuggestingMove = false;
         m_PendingEngineMove = Chess::Move();
     }
 

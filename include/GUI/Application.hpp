@@ -67,8 +67,14 @@ private:
     void commitPromotion(Chess::MoveFlag promotionFlag);
     int hitTestPromotionMenu(sf::Vector2i mousePos) const;
 
-    void pollEngineMove();
+    void pollEngineMove(bool suggestOnly = false);
     void updateEvaluation();
+
+    [[nodiscard]]
+    std::vector<Arrow>::iterator findArrow(uint8_t start, uint8_t end);
+
+    void toggleArrow(uint8_t start, uint8_t end);
+    void addArrow(uint8_t start, uint8_t end);
 
     void renderBoard(sf::RenderTarget& target) const;
     void renderSquareHighlight(sf::RenderTarget& target, uint8_t square, sf::Color color) const;
@@ -119,6 +125,7 @@ private:
     bool m_PromotionSelectionActive{false};
     bool m_EngineThinking{false};
     bool m_InspectionMode{false};
+    bool m_SuggestingMove{false};
 
     // UI / UX
     std::size_t m_CurrentThemeIdx{0};
