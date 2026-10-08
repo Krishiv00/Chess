@@ -656,7 +656,9 @@ void Application::onMouseButtonSignal(sf::Vector2i position, bool released) {
     if (released) {
         if (hasSelectedPiece() && idx != m_SelectedPiece) dropPiece(idx);
     } else {
-        if (hasSelectedPiece()) dropPiece(idx, true);
+        const bool clickedOwnPiece = (m_Board.GetOccupancyMap(m_SideToMove) & Chess::IndexToMask(idx)) != 0ull;
+
+        if (hasSelectedPiece()) dropPiece(idx, true, !clickedOwnPiece);
 
         pickPiece(idx);
     }
@@ -672,7 +674,7 @@ void Application::pickPiece(int idx) {
     }
 }
 
-void Application::dropPiece(int idx, bool animate) {
+void Application::dropPiece(int idx, bool animate, bool playIllegalSfx) {
     const auto it = std::find(m_LegalMovesForSelectedPiece.begin(), m_LegalMovesForSelectedPiece.end(),
         Chess::Move(m_SelectedPiece, idx)
     );
@@ -687,7 +689,7 @@ void Application::dropPiece(int idx, bool animate) {
         doMove(*it, animate);
 
         if (!m_GameOver && !m_InspectionMode) pollEngineMove();
-    } else if (idx != m_SelectedPiece) {
+    } else if (idx != m_SelectedPiece && playIllegalSfx) {
         m_SfxPlayer.Play(Sfx::Illegal);
     }
 

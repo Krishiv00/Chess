@@ -62,7 +62,7 @@ private:
     void doMove(Chess::Move move, bool animate);
     void onMouseButtonSignal(sf::Vector2i position, bool released);
     void pickPiece(int idx);
-    void dropPiece(int idx, bool animate = false);
+    void dropPiece(int idx, bool animate = false, bool playIllegalSfx = true);
 
     void commitPromotion(Chess::MoveFlag promotionFlag);
     int hitTestPromotionMenu(sf::Vector2i mousePos) const;
