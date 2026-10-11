@@ -295,30 +295,6 @@ namespace Chess {
         float getEndgameWeight() const;
 
         [[nodiscard]]
-        int evalForceKingToCorner(PieceColor sideToMove) const noexcept;
-
-        [[nodiscard]]
-        int evalKingDanger(PieceColor sideToMove, uint64_t occ) const noexcept;
-
-        [[nodiscard]]
-        int evalPawnShield(PieceColor sideToMove) const noexcept;
-
-        [[nodiscard]]
-        int evalOneSidePawnStructure(
-            uint64_t pawns, uint64_t enemyPawns, uint64_t allPieces,
-            int myKingSq, int oppKingSq, bool pawnIsBlack, float endgameWeight
-        ) const noexcept;
-
-        [[nodiscard]]
-        int evalPawnStructure(PieceColor sideToMove, uint64_t occ, float endgameWeight) const noexcept;
-
-        [[nodiscard]]
-        int evalMobility(PieceColor sideToMove, uint64_t myOcc, uint64_t enemyOcc, uint64_t occ, float endgameWeight) const noexcept;
-
-        [[nodiscard]]
-        int evalCountMaterial(PieceColor sideToMove, float endgameWeight) const noexcept;
-
-        [[nodiscard]]
         int evaluate(PieceColor sideToMove, float endgameWeight) const noexcept;
 
         [[nodiscard]]

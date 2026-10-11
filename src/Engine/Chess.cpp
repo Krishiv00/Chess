@@ -5,6 +5,7 @@
 #include <thread>
 #include <chrono>
 #include <unordered_set>
+#include <array>
 
 #include "Engine/Chess.hpp"
 
@@ -200,30 +201,41 @@ public:
     };
 
     struct TTEntry {
-        uint64_t Key{0};
+        uint32_t Key{0};
         int32_t Score{0};
         int8_t Depth{-1};
         TTFlag NodeFlag;
+        uint8_t Age{0};
         TTMove BestMove;
     };
 
 private:
     std::vector<TTEntry> m_Entries;
+    uint8_t m_Age{0};
+
+    static constexpr inline uint32_t KeyCheck(uint64_t key) noexcept {
+        return static_cast<uint32_t>(key >> 32);
+    }
 
 public:
     void Clear() {
         std::memset(m_Entries.data(), 0, m_Entries.size() * sizeof(TTEntry));
     }
 
+    // called once per new search so that entries from earlier searches can be replaced
+    void NewSearch() noexcept {
+        ++m_Age;
+    }
+
     const TTEntry* Peek(uint64_t key) const noexcept {
         const TTEntry& e = m_Entries[key % m_Entries.size()];
-        return (e.Key == key) ? &e : nullptr;
+        return (e.Key == KeyCheck(key)) ? &e : nullptr;
     }
 
     bool Probe(uint64_t key, int depth, int alpha, int beta, int& score, Move& bestMove) const {
         const TTEntry& entry = m_Entries[key % m_Entries.size()];
 
-        if (entry.Key != key) return false;
+        if (entry.Key != KeyCheck(key)) return false;
 
         // move isn't strict to depth since it's used for move ordering
         // even if it's not good it has a higher chance of being better than the other moves
@@ -253,9 +265,9 @@ public:
     void Store(uint64_t key, int depth, int score, TTFlag flag, Move bestMove) {
         TTEntry& entry = m_Entries[key % m_Entries.size()];
 
-        // only update if it comes from a deeper search than whats already present
-        if (entry.Depth <= depth) {
-            entry = TTEntry(key, score, depth, flag, TTMove(bestMove.StartingSquare, bestMove.TargetSquare));
+        // replace if the slot is from an older search, or if the new result is at least as deep
+        if (entry.Age != m_Age || entry.Depth <= depth) {
+            entry = TTEntry(KeyCheck(key), score, static_cast<int8_t>(depth), flag, m_Age, TTMove(bestMove.StartingSquare, bestMove.TargetSquare));
         }
     }
 
@@ -274,7 +286,9 @@ class PawnTranspositionTable {
 public:
     struct PawnTTEntry {
         uint64_t Key{0};
-        int32_t Score{0};
+        uint64_t Passed[2]{0, 0};
+        int16_t Mg{0};
+        int16_t Eg{0};
     };
 
 private:
@@ -286,12 +300,16 @@ public:
     }
 
     const PawnTTEntry* Probe(uint64_t key) const noexcept {
+        if (m_Entries.empty()) return nullptr;
         const PawnTTEntry& e = m_Entries[key % m_Entries.size()];
         return (e.Key == key) ? &e : nullptr;
     }
 
-    void Store(uint64_t key, int score) noexcept {
-        m_Entries[key % m_Entries.size()] = PawnTTEntry(key, score);
+    void Store(uint64_t key, const PawnTTEntry& entry) noexcept {
+        if (m_Entries.empty()) return;
+        PawnTTEntry& slot = m_Entries[key % m_Entries.size()];
+        slot = entry;
+        slot.Key = key;
     }
 
     void SetSize(unsigned int sizeMb) {
@@ -614,13 +632,15 @@ struct GameContext {
 
 struct SearchContext {
     static inline void BeginNew(uint64_t currentHash) {
-        for (auto& h : HistoryTable) h >>= 2;
+        for (auto& h : HistoryTable) h /= 2;
 
         std::memset(killerMoves, 0, sizeof(killerMoves));
         std::memset(PositionHistory, 0, sizeof(PositionHistory));
         std::memset(ExcludedMove, 0, sizeof(ExcludedMove));
 
         PositionHistory[0] = currentHash;
+
+        GameContext::TT.NewSearch();
 
         Cancelled.store(false, std::memory_order_relaxed);
     }
@@ -634,7 +654,14 @@ struct SearchContext {
     // maximum number of ply extensions allowed
     static constexpr inline const int MaxExt = 6;
 
-    static inline uint32_t HistoryTable[Ranks * Files * Ranks * Files];
+    static inline int32_t HistoryTable[Ranks * Files * Ranks * Files];
+    static constexpr inline int MaxHistory = 16384;
+
+    static inline void UpdateHistory(int from, int to, int bonus) noexcept {
+        int32_t& h = HistoryTable[from * (Ranks * Files) + to];
+        h += bonus - h * std::abs(bonus) / MaxHistory;
+    }
+
     static inline uint64_t PositionHistory[MaxPly];
     static inline Move killerMoves[MaxPly][2];
     static inline Move ExcludedMove[MaxPly];
@@ -675,6 +702,12 @@ namespace LUTs {
     static inline uint64_t PawnShield2[2][64];
     // precomputed reductions for LMR
     static inline int Reduction[SearchContext::MaxPly][SearchContext::MaxMoves];
+    // pawns on the files next to a given file
+    static inline uint64_t AdjacentFiles[8];
+    // adjacent-file squares on the same rank or behind (own side), used to detect backward pawns
+    static inline uint64_t BackSupport[2][64];
+    // king zone: king square + ring + one extra rank towards the enemy
+    static inline uint64_t KingZone[2][64];
 
     // scores for knight mobility, legal moves
     static constexpr inline int KnightMobilityScore[] = {
@@ -846,6 +879,49 @@ namespace LUTs {
         }
     }
 
+    static inline void InitPawnHelperTables() {
+        for (int f = 0; f < Files; ++f) {
+            uint64_t m = 0ull;
+            if (f > 0) m |= 0x0101010101010101ull << (f - 1);
+            if (f < Files - 1) m |= 0x0101010101010101ull << (f + 1);
+            AdjacentFiles[f] = m;
+        }
+
+        for (int sq = 0; sq < Ranks * Files; ++sq) {
+            const int r = ToRank(sq);
+            const int f = ToFile(sq);
+
+            for (const int col : {0, 1}) {
+                // "behind" for white = higher rank index, for black = lower rank index
+                const int back = col ? -1 : 1;
+                uint64_t support = 0ull;
+
+                for (int nr = r; nr >= 0 && nr < Ranks; nr += back) {
+                    for (const int df : {-1, 1}) {
+                        const int nf = f + df;
+                        if (nf >= 0 && nf < Files) support |= IndexToMask(To2DIndex(nr, nf));
+                    }
+                }
+
+                BackSupport[col][sq] = support;
+
+                // king zone: 3x3 around the king plus the rank in front of that (towards the enemy)
+                const int fwd = col ? 1 : -1;
+                uint64_t zone = KingAttacks[sq] | IndexToMask(sq);
+
+                const int zr = r + 2 * fwd;
+                if (zr >= 0 && zr < Ranks) {
+                    for (int df = -1; df <= 1; ++df) {
+                        const int nf = f + df;
+                        if (nf >= 0 && nf < Files) zone |= IndexToMask(To2DIndex(zr, nf));
+                    }
+                }
+
+                KingZone[col][sq] = zone;
+            }
+        }
+    }
+
     static inline void InitLMRTable() {
         for (int p = 1; p < SearchContext::MaxPly; ++p) {
             for (int m = 1; m < SearchContext::MaxMoves; ++m) {
@@ -859,6 +935,7 @@ namespace LUTs {
         InitRayTable();
         InitPassedPawnTable();
         InitPawnShieldTable();
+        InitPawnHelperTables();
         InitLMRTable();
     }
 }
@@ -2076,7 +2153,7 @@ unsigned int Chess::Board::GetHashSize() const noexcept {
 #pragma region PST
 
 namespace PieceSquareTables {
-    static constexpr inline const int8_t Table[][Ranks * Files] = {
+    static constexpr inline const int8_t TableRaw[][Ranks * Files] = {
         // pawn earlygame
         {
             -46, -46, -46, -46, -46, -46, -46, -46,
@@ -2222,6 +2299,41 @@ namespace PieceSquareTables {
         },
     };
 
+    static constexpr auto BuildTable() {
+        std::array<std::array<int8_t, Ranks* Files>, 12> t{};
+
+        for (int i = 0; i < 12; ++i) {
+            for (int sq = 0; sq < Ranks * Files; ++sq) t[i][sq] = TableRaw[i][sq];
+        }
+
+        // indices: 1 bishop, 2 knight, 4 queen (early) +6 for the endgame tables, 9 = rook endgame
+        for (const int i : {1, 2, 4, 7, 8, 10, 9}) {
+            for (int r = 0; r < Ranks; ++r) {
+                for (int f = 0; f < Files / 2; ++f) {
+                    const int a = r * Files + f;
+                    const int b = r * Files + (Files - 1 - f);
+                    const int avg = (TableRaw[i][a] + TableRaw[i][b]) / 2;
+                    t[i][a] = static_cast<int8_t>(avg);
+                    t[i][b] = static_cast<int8_t>(avg);
+                }
+            }
+        }
+
+        return t;
+    }
+
+    static constexpr inline auto Table = BuildTable();
+
+    [[nodiscard]]
+    static constexpr inline int PstMg(int pieceTypeIdx, int sq, bool isBlack) noexcept {
+        return Table[pieceTypeIdx][isBlack ? Utils::Mirror(sq) : sq];
+    }
+
+    [[nodiscard]]
+    static constexpr inline int PstEg(int pieceTypeIdx, int sq, bool isBlack) noexcept {
+        return Table[pieceTypeIdx + 6][isBlack ? Utils::Mirror(sq) : sq];
+    }
+
     [[nodiscard]]
     static constexpr inline int GetPSTScore(int pieceTypeIdx, int sq, bool isBlack, float endgameWeight) noexcept {
         if (isBlack) sq = Utils::Mirror(sq);
@@ -2254,345 +2366,560 @@ float Board::getEndgameWeight() const {
     return 1.f - std::clamp(static_cast<float>(phase) / MaxPhase, 0.f, 1.f);
 }
 
-#pragma region King Corner
+#pragma region Eval Helpers
 
-int Board::evalForceKingToCorner(PieceColor sideToMove) const noexcept {
-    const bool isBlack = sideToMove == PieceColor::Black;
-    const int oppKing = MaskToIndex(m_PieceMask[isBlack ? 5 : 11]);
+namespace {
+    struct Score {
+        int mg{0};
+        int eg{0};
 
-    const int oppRank = ToRank(oppKing);
-    const int oppFile = ToFile(oppKing);
+        constexpr Score() = default;
+        constexpr Score(int m, int e) : mg(m), eg(e) {}
 
-    // push opponent king toward edge, proximity toward king
-    const int myKing = MaskToIndex(m_PieceMask[isBlack ? 11 : 5]);
-    const int kingDist = std::abs(ToRank(oppKing) - ToRank(myKing)) + std::abs(ToFile(oppKing) - ToFile(myKing));
-
-    return (
-        (std::max(3 - oppRank, oppRank - 4) + std::max(3 - oppFile, oppFile - 4)) * 10 +
-        (14 - kingDist) * 5
-    );
-}
-
-#pragma region King Danger
-
-int Board::evalKingDanger(PieceColor sideToMove, uint64_t occ) const noexcept {
-    const bool isBlack = sideToMove == PieceColor::Black;
-    const int myOff = isBlack ? 6 : 0;
-    const int oppOff = myOff ^ 6;
-
-    const int kingSq = MaskToIndex(m_PieceMask[myOff + 5]);
-    const uint64_t kingZone = LUTs::KingAttacks[kingSq];
-
-    int attackWeight = 0;
-    int attackerCount = 0;
-
-    // knights attacking king zone
-    for (uint64_t tmp = m_PieceMask[oppOff + 2]; tmp; tmp &= tmp - 1) {
-        if (LUTs::KnightAttacks[MaskToIndex(tmp)] & kingZone) {
-            attackWeight += 20;
-            ++attackerCount;
+        constexpr Score& operator+=(const Score& o) noexcept {
+            mg += o.mg; eg += o.eg; return *this;
         }
-    }
-
-    // bishops
-    for (uint64_t tmp = m_PieceMask[oppOff + 1]; tmp; tmp &= tmp - 1) {
-        const uint64_t atk = MagicBitboard::DiagonalAttacks(MaskToIndex(tmp), occ);
-        if (atk & kingZone) {
-            attackWeight += 20;
-            ++attackerCount;
+        constexpr Score& operator-=(const Score& o) noexcept {
+            mg -= o.mg; eg -= o.eg; return *this;
         }
+    };
+
+    constexpr Score operator+(Score a, const Score& b) noexcept {
+        return a += b;
     }
 
-    // rooks
-    for (uint64_t tmp = m_PieceMask[oppOff + 3]; tmp; tmp &= tmp - 1) {
-        const uint64_t atk = MagicBitboard::OrthogonalAttacks(MaskToIndex(tmp), occ);
-        if (atk & kingZone) {
-            attackWeight += 40;
-            ++attackerCount;
-        }
+    constexpr Score operator-(Score a, const Score& b) noexcept {
+        return a -= b;
     }
 
-    // queens
-    for (uint64_t tmp = m_PieceMask[oppOff + 4]; tmp; tmp &= tmp - 1) {
-        const uint64_t atk = MagicBitboard::CombinedAttacks(MaskToIndex(tmp), occ);
-        if (atk & kingZone) {
-            attackWeight += 80;
-            ++attackerCount;
-        }
+    constexpr Score operator*(const Score& a, int k) noexcept {
+        return Score(a.mg * k, a.eg * k);
     }
 
-    // scale the score non-linearly with a cap of max 8 attackers
-    static constexpr int DangerScale[] = {0, 0, 50, 75, 88, 94, 97, 99, 100};
-    const int scale = DangerScale[std::min(attackerCount, 8)];
-
-    return (attackWeight * scale) / 100;
-}
-
-#pragma region Pawn Shield
-
-int Board::evalPawnShield(PieceColor sideToMove) const noexcept {
-    const bool isBlack = sideToMove == PieceColor::Black;
-    const int myOff = isBlack * 6;
-
-    const int kingSq = MaskToIndex(m_PieceMask[myOff + 5]);
-    const uint64_t myPawns = m_PieceMask[myOff];
-
-    return (
-        // each missing pawn in the immediate shield costs 20
-        -NumBitsOn(LUTs::PawnShield[isBlack][kingSq] & ~myPawns) * 20
-        // each missing pawn on the second rank costs 10
-        - NumBitsOn(LUTs::PawnShield2[isBlack][kingSq] & ~myPawns) * 10
-    );
-}
-
-#pragma region Pawn Structure
-
-int Board::evalOneSidePawnStructure(
-    uint64_t pawns, uint64_t enemyPawns, uint64_t allPieces,
-    int myKingSq, int oppKingSq,
-    bool pawnIsBlack, float endgameWeight
-) const noexcept {
-    int score = 0;
-
-    int fileCounts[Files] = {};
-    int passedOnFile[Files] = {};
-
-    // passed pawn bonus
-    for (uint64_t tmp = pawns; tmp; tmp &= tmp - 1) {
-        const int sq = MaskToIndex(tmp);
-        const int f = ToFile(sq);
-
-        ++fileCounts[f];
-
-        if (!(LUTs::PassedPawn[pawnIsBlack][sq] & enemyPawns)) {
-            ++passedOnFile[f];
-
-            const int rank = ToRank(sq);
-            const int advancement = pawnIsBlack ? rank : (Ranks - 1 - rank);
-
-            // reduce bonus if any piece is blocking the promotion path
-            const uint64_t frontSpan = LUTs::PassedPawn[pawnIsBlack][sq] & Utils::FileMask(f);
-            const float blockadeFactor = (frontSpan & allPieces) ? 0.4f : 1.0f;
-
-            score += static_cast<int>(5 * advancement * advancement * (1.f + endgameWeight) * blockadeFactor);
-
-            // reward opponent king being far
-            const int defenderDist = std::abs(ToRank(oppKingSq) - ToRank(sq)) + std::abs(ToFile(oppKingSq) - ToFile(sq));
-            score += static_cast<int>((defenderDist - 3) * 4 * endgameWeight);
-        }
+    [[nodiscard]]
+    constexpr inline int ChebDist(int a, int b) noexcept {
+        return std::max(std::abs(ToRank(a) - ToRank(b)), std::abs(ToFile(a) - ToFile(b)));
     }
 
-    // isolated pawn penalty
-    for (int f = 0; f < Files; ++f) {
-        if (!fileCounts[f]) continue;
-
-        const bool hasLeft = (f > 0) && fileCounts[f - 1];
-        const bool hasRight = (f < Files - 1) && fileCounts[f + 1];
-
-        if (!hasLeft && !hasRight) score -= 20;
+    [[nodiscard]]
+    constexpr inline int ManhattanDist(int a, int b) noexcept {
+        return std::abs(ToRank(a) - ToRank(b)) + std::abs(ToFile(a) - ToFile(b));
     }
 
-    // doubled pawn penalty
-    for (int f = 0; f < Files; ++f) {
-        const int count = fileCounts[f];
-        if (count < 2) continue;
+    constexpr uint64_t FileA = 0x0101010101010101ull;
+    constexpr uint64_t FileH = 0x8080808080808080ull;
 
-        const int doubled = count - 1;
-        const int passedDoubled = std::min(doubled, passedOnFile[f]);
-        const int normalDoubled = doubled - passedDoubled;
+    // indexed by how far the pawn has advanced (1 = on its starting rank, 6 = one step from promotion)
+    constexpr Score SupportedPawn[8] = {{0, 0}, {0, 0}, {4, 4}, {6, 7}, {10, 12}, {18, 22}, {30, 40}, {0, 0}};
+    constexpr Score PhalanxPawn[8] = {{0, 0}, {3, 2}, {5, 4}, {8, 7}, {13, 12}, {22, 24}, {34, 38}, {0, 0}};
 
-        score -= normalDoubled * 15 + passedDoubled * 7;
+    constexpr int AttackerCountScaleOld[] = {0, 0, 50, 75, 88, 94, 97, 99, 100};
+    constexpr int AttackerCountScaleNew[] = {0, 40, 70, 90, 100, 100, 100, 100, 100};
+
+    // non-pawn material in centipawns on a "textbook" scale, only used for deciding what is winning / drawn
+    [[nodiscard]]
+    inline int NonPawnMaterial(const uint64_t* pm, int c) noexcept {
+        return 300 * (NumBitsOn(pm[c * 6 + 1]) + NumBitsOn(pm[c * 6 + 2])) +
+            500 * NumBitsOn(pm[c * 6 + 3]) + 900 * NumBitsOn(pm[c * 6 + 4]);
     }
 
-    // connected passed pawn bonus
-    for (int f = 0; f < Files; ++f) {
-        if (!passedOnFile[f]) continue;
-        const bool leftPassed = (f > 0) && passedOnFile[f - 1];
-        const bool rightPassed = (f < Files - 1) && passedOnFile[f + 1];
-
-        if (leftPassed || rightPassed) {
-            score += static_cast<int>(30 * endgameWeight);
-        }
+    [[nodiscard]]
+    constexpr inline bool IsLightSquare(int sq) noexcept {
+        return ((ToRank(sq) + ToFile(sq)) & 1) == 0;
     }
 
-    return score;
-}
+    Score EvalPawnsAndKing(const Board& b, int c, uint64_t& passedOut) noexcept {
+        const bool black = c == 1;
+        const int off = c * 6;
+        const int e = c ^ 1;
 
-int Board::evalPawnStructure(PieceColor sideToMove, uint64_t occ, float endgameWeight) const noexcept {
-    if (const auto* e = GameContext::PawnTT.Probe(m_PawnAndKingHash)) {
-        return sideToMove == PieceColor::White ? e->Score : -e->Score;
-    }
+        const uint64_t pawns = b.m_PieceMask[off];
+        const uint64_t enemyPawns = b.m_PieceMask[e * 6];
 
-    const uint64_t whitePawns = m_PieceMask[0];
-    const uint64_t blackPawns = m_PieceMask[6];
+        Score s;
+        int fileCounts[Files] = {};
+        int passedOnFile[Files] = {};
+        uint64_t passed = 0ull;
 
-    const int whiteKingSq = MaskToIndex(m_PieceMask[5]);
-    const int blackKingSq = MaskToIndex(m_PieceMask[11]);
-
-    const int score = (
-        evalOneSidePawnStructure(whitePawns, blackPawns, occ, whiteKingSq, blackKingSq, false, endgameWeight) -
-        evalOneSidePawnStructure(blackPawns, whitePawns, occ, blackKingSq, whiteKingSq, true, endgameWeight)
-    );
-
-    GameContext::PawnTT.Store(m_PawnAndKingHash, score);
-
-    return sideToMove == PieceColor::White ? score : -score;
-}
-
-#pragma region Mobility
-
-int Board::evalMobility(PieceColor sideToMove, uint64_t myOcc, uint64_t enemyOcc, uint64_t occ, float endgameWeight) const noexcept {
-    const bool isBlack = sideToMove == PieceColor::Black;
-
-    const int myOff = isBlack ? 6 : 0;
-    const int oppOff = myOff ^ 6;
-
-    // knight fork targets
-    const uint64_t myForkTargets = m_PieceMask[oppOff + 3] | m_PieceMask[oppOff + 4] | m_PieceMask[oppOff + 5];
-    const uint64_t oppForkTargets = m_PieceMask[myOff + 3] | m_PieceMask[myOff + 4] | m_PieceMask[myOff + 5];
-
-    int score = 0;
-
-    const uint64_t notMy = ~myOcc;
-
-    // bishops
-    for (uint64_t tmp = m_PieceMask[myOff + 1]; tmp; tmp &= tmp - 1) {
-        const int moves = NumBitsOn(MagicBitboard::DiagonalAttacks(MaskToIndex(tmp), occ) & notMy);
-        score += LUTs::BishopMobilityScore[moves];
-    }
-
-    // knights
-    for (uint64_t tmp = m_PieceMask[myOff + 2]; tmp; tmp &= tmp - 1) {
-        const int sq = MaskToIndex(tmp);
-
-        const int moves = NumBitsOn(LUTs::KnightAttacks[sq] & notMy);
-        score += LUTs::KnightMobilityScore[moves];
-
-        if (NumBitsOn(LUTs::KnightAttacks[sq] & myForkTargets) >= 2) score += 40;
-    }
-
-    // rooks
-    for (uint64_t tmp = m_PieceMask[myOff + 3]; tmp; tmp &= tmp - 1) {
-        const int moves = NumBitsOn(MagicBitboard::OrthogonalAttacks(MaskToIndex(tmp), occ) & notMy);
-        score += LUTs::RookMobilityScore[moves];
-    }
-
-    // queens
-    for (uint64_t tmp = m_PieceMask[myOff + 4]; tmp; tmp &= tmp - 1) {
-        const int moves = NumBitsOn(MagicBitboard::CombinedAttacks(MaskToIndex(tmp), occ) & notMy);
-        score += LUTs::QueenMobilityScore[moves];
-    }
-
-    const uint64_t notOpp = ~enemyOcc;
-
-    // bishops
-    for (uint64_t tmp = m_PieceMask[oppOff + 1]; tmp; tmp &= tmp - 1) {
-        const int moves = NumBitsOn(MagicBitboard::DiagonalAttacks(MaskToIndex(tmp), occ) & notOpp);
-        score -= LUTs::BishopMobilityScore[moves];
-    }
-
-    // knights
-    for (uint64_t tmp = m_PieceMask[oppOff + 2]; tmp; tmp &= tmp - 1) {
-        const int sq = MaskToIndex(tmp);
-        const int moves = NumBitsOn(LUTs::KnightAttacks[sq] & notOpp);
-        score -= LUTs::KnightMobilityScore[moves];
-
-        if (NumBitsOn(LUTs::KnightAttacks[sq] & oppForkTargets) >= 2) score -= 40;
-    }
-
-    // rooks
-    for (uint64_t tmp = m_PieceMask[oppOff + 3]; tmp; tmp &= tmp - 1) {
-        const int moves = NumBitsOn(MagicBitboard::OrthogonalAttacks(MaskToIndex(tmp), occ) & notOpp);
-        score -= LUTs::RookMobilityScore[moves];
-    }
-
-    // queens
-    for (uint64_t tmp = m_PieceMask[oppOff + 4]; tmp; tmp &= tmp - 1) {
-        const int moves = NumBitsOn(MagicBitboard::CombinedAttacks(MaskToIndex(tmp), occ) & notOpp);
-        score -= LUTs::QueenMobilityScore[moves];
-    }
-
-    return score;
-}
-
-#pragma region Material + PST
-
-int Board::evalCountMaterial(PieceColor sideToMove, float endgameWeight) const noexcept {
-    int material = 0;
-
-    const bool isBlack = sideToMove == PieceColor::Black;
-    const int myOff = isBlack ? 6 : 0;
-    const int oppOff = myOff ^ 6;
-
-    const uint64_t myPawns = m_PieceMask[myOff];
-    const uint64_t oppPawns = m_PieceMask[oppOff];
-
-    for (int pt = 0; pt < 5; ++pt) {
-        const int val = Utils::IntLerp(PieceValues[pt], PieceEgValues[pt], endgameWeight);
-
-        for (uint64_t tmp = m_PieceMask[myOff + pt]; tmp; tmp &= tmp - 1) {
+        for (uint64_t tmp = pawns; tmp; tmp &= tmp - 1) {
             const int sq = MaskToIndex(tmp);
-            material += val + PieceSquareTables::GetPSTScore(pt, sq, isBlack, endgameWeight);
+            const int f = ToFile(sq);
+            const int r = ToRank(sq);
+            const int adv = black ? r : (Ranks - 1 - r);
 
-            // rook on open / semi-open file
-            if (pt == 3) {
-                const uint64_t file = Utils::FileMask(ToFile(sq));
-                const bool noMine = !(file & myPawns);
-                const bool noOpp = !(file & oppPawns);
-                if (noMine && noOpp) material += 20;
-                else if (noMine) material += 10;
+            ++fileCounts[f];
+
+            // material + piece square table
+            s += Score(
+                PieceValues[0] + PieceSquareTables::PstMg(0, sq, black),
+                PieceEgValues[0] + PieceSquareTables::PstEg(0, sq, black)
+            );
+
+            const bool isPassed = !(LUTs::PassedPawn[c][sq] & enemyPawns);
+            if (isPassed) {
+                passed |= IndexToMask(sq);
+                ++passedOnFile[f];
+            }
+
+            const uint64_t frontFile = LUTs::PassedPawn[c][sq] & Utils::FileMask(f);
+            const bool opposed = (frontFile & enemyPawns) != 0;
+            const bool isolated = !(LUTs::AdjacentFiles[f] & pawns);
+
+            const uint64_t sameRankNeighbours =
+                ((f > 0) ? IndexToMask(sq - 1) : 0ull) | ((f < Files - 1) ? IndexToMask(sq + 1) : 0ull);
+
+            const bool supported = (LUTs::PawnAttacks[e][sq] & pawns) != 0;
+            const bool phalanx = (sameRankNeighbours & pawns) != 0;
+
+            if (isolated) {
+                s += Score(-14, -18);
+                if (!opposed) s += Score(-8, -4); // isolated on a half open file is a target
+            } else if (!(LUTs::BackSupport[c][sq] & pawns)) {
+                const int stop = sq + (black ? Files : -Files);
+                if (LUTs::PawnAttacks[c][stop] & enemyPawns) {
+                    s += Score(-9, -12);
+                    if (!opposed) s += Score(-8, -4);
+                }
+            }
+
+            if (supported) s += SupportedPawn[adv];
+            if (phalanx) s += PhalanxPawn[adv];
+        }
+
+
+        for (int f = 0; f < Files; ++f) {
+            const int count = fileCounts[f];
+            if (count < 2) continue;
+
+            const int doubled = count - 1;
+            const int passedDoubled = std::min(doubled, passedOnFile[f]);
+            const int normalDoubled = doubled - passedDoubled;
+
+            s -= Score(12, 18) * normalDoubled + Score(6, 10) * passedDoubled;
+        }
+
+        // connected passed pawns
+        for (int f = 0; f < Files; ++f) {
+            if (!passedOnFile[f]) continue;
+            const bool leftPassed = (f > 0) && passedOnFile[f - 1];
+            const bool rightPassed = (f < Files - 1) && passedOnFile[f + 1];
+
+            if (leftPassed || rightPassed) s += Score(0, 30);
+        }
+
+        /* king: piece square table + pawn shield + open files in front of it */ {
+            const int kingSq = MaskToIndex(b.m_PieceMask[off + 5]);
+
+            s += Score(PieceSquareTables::PstMg(5, kingSq, black), PieceSquareTables::PstEg(5, kingSq, black));
+
+            const int missing1 = NumBitsOn(LUTs::PawnShield[c][kingSq] & ~pawns);
+            const int missing2 = NumBitsOn(LUTs::PawnShield2[c][kingSq] & ~pawns);
+
+            s -= Score(missing1 * 20 + missing2 * 10, 0);
+
+            const int kf = ToFile(kingSq);
+            for (int f = std::max(0, kf - 1); f <= std::min(Files - 1, kf + 1); ++f) {
+                const uint64_t fm = Utils::FileMask(f);
+                if (!(fm & pawns)) s -= Score((fm & enemyPawns) ? 10 : 16, 0);
             }
         }
 
-        for (uint64_t tmp = m_PieceMask[oppOff + pt]; tmp; tmp &= tmp - 1) {
-            const int sq = MaskToIndex(tmp);
-            material -= val + PieceSquareTables::GetPSTScore(pt, sq, !isBlack, endgameWeight);
+        passedOut = passed;
+        return s;
+    }
 
-            // rook on open / semi-open file
-            if (pt == 3) {
-                const uint64_t file = Utils::FileMask(ToFile(sq));
-                const bool noOpp = !(file & oppPawns);
-                const bool noMine = !(file & myPawns);
-                if (noOpp && noMine) material -= 20;
-                else if (noOpp) material -= 10;
+    [[nodiscard]]
+    PawnTranspositionTable::PawnTTEntry BuildPawnEntry(const Board& b) noexcept {
+        PawnTranspositionTable::PawnTTEntry entry;
+
+        Score total = EvalPawnsAndKing(b, 0, entry.Passed[0]);
+        total -= EvalPawnsAndKing(b, 1, entry.Passed[1]);
+
+        entry.Mg = static_cast<int16_t>(total.mg);
+        entry.Eg = static_cast<int16_t>(total.eg);
+
+        return entry;
+    }
+
+    Score EvalPassers(const Board& b, int c, uint64_t passed, uint64_t occ, bool enemyToMove) noexcept {
+        if (!passed) return Score();
+
+        const bool black = c == 1;
+        const int e = c ^ 1;
+        const uint64_t* pm = b.m_PieceMask;
+
+        const int ownKing = MaskToIndex(pm[c * 6 + 5]);
+        const int oppKing = MaskToIndex(pm[e * 6 + 5]);
+
+        // the enemy has only a king + pawns, so only his king can stop a passed pawn
+        const bool onlyKingDefends = !(pm[e * 6 + 1] | pm[e * 6 + 2] | pm[e * 6 + 3] | pm[e * 6 + 4]);
+
+        Score s;
+
+        for (uint64_t tmp = passed; tmp; tmp &= tmp - 1) {
+            const int sq = MaskToIndex(tmp);
+            const int f = ToFile(sq);
+            const int r = ToRank(sq);
+            const int adv = black ? r : (Ranks - 1 - r);
+
+            const int base = 5 * adv * adv;
+
+            const uint64_t front = LUTs::PassedPawn[c][sq] & Utils::FileMask(f);
+            const int stop = sq + (black ? Files : -Files);
+
+            // reduce bonus if a piece is blocking the promotion path, a lot more if it is the stop square
+            int pct = 100;
+            if (occ & IndexToMask(stop)) pct = 40;
+            else if (front & occ) pct = 70;
+
+            s += Score(base * pct / 100, 2 * base * pct / 100);
+
+            // king proximity to the stop square: the enemy king being far / our king being close matters
+            // more the further the pawn has advanced
+            if (adv >= 3) {
+                const int w = 5 * adv - 13;
+                const int oppD = ChebDist(oppKing, stop);
+                const int ownD = ChebDist(ownKing, stop);
+
+                s += Score(0, ((oppD * 19 / 4 - ownD * 2) * w) / 4);
+            }
+
+            // rule of the square: nothing but the enemy king can stop the pawn and it is out of reach
+            if (onlyKingDefends && !(front & occ)) {
+                int steps = Ranks - 1 - adv;
+                if (adv == 1) --steps; // double push
+
+                const int promoSq = black ? (Ranks * (Ranks - 1) + f) : f;
+                const int kingDist = ChebDist(oppKing, promoSq) - (enemyToMove ? 1 : 0);
+
+                if (kingDist > steps) s += Score(0, 400);
             }
         }
+
+        return s;
     }
 
-    /* king PST */ {
-        const int mySq = MaskToIndex(m_PieceMask[myOff + 5]);
-        const int oppSq = MaskToIndex(m_PieceMask[oppOff + 5]);
+    struct AttackMaps {
+        uint64_t byPiece[2][6]{};
+        uint64_t all[2]{};
+    };
 
-        material += PieceSquareTables::GetPSTScore(5, mySq, isBlack, endgameWeight);
-        material -= PieceSquareTables::GetPSTScore(5, oppSq, !isBlack, endgameWeight);
+    Score EvalPieces(const Board& b, uint64_t occW, uint64_t occB, uint64_t occ) noexcept {
+        const uint64_t* pm = b.m_PieceMask;
+        const uint64_t colorOcc[2] = {occW, occB};
+
+        AttackMaps am;
+
+        am.byPiece[0][0] = ((pm[0] & ~FileA) >> 9) | ((pm[0] & ~FileH) >> 7);
+        am.byPiece[1][0] = ((pm[6] & ~FileA) << 7) | ((pm[6] & ~FileH) << 9);
+
+        int kingSq[2];
+        for (int c = 0; c < 2; ++c) {
+            kingSq[c] = MaskToIndex(pm[c * 6 + 5]);
+            am.byPiece[c][5] = LUTs::KingAttacks[kingSq[c]];
+        }
+
+        // king attack bookkeeping, indexed by the side whose king is being attacked
+        int attackers[2] = {};
+        int units[2] = {};
+        int zoneHits[2] = {};
+
+        Score total;
+
+        for (int c = 0; c < 2; ++c) {
+            const bool black = c == 1;
+            const int off = c * 6;
+            const int e = c ^ 1;
+            const uint64_t myOcc = colorOcc[c];
+            const uint64_t enemyPawnAttacks = am.byPiece[e][0];
+
+            // squares that count for mobility: not our own pieces, not controlled by an enemy pawn
+            const uint64_t area = ~myOcc & ~enemyPawnAttacks;
+
+            const uint64_t zone = LUTs::KingZone[e][kingSq[e]];
+
+            const uint64_t forkTargets = pm[e * 6 + 3] | pm[e * 6 + 4] | pm[e * 6 + 5];
+
+            Score s;
+
+            const auto noteZone = [&](uint64_t atk, int weight) {
+                if (atk & zone) {
+                    ++attackers[e];
+                    units[e] += weight;
+                    zoneHits[e] += NumBitsOn(atk & zone);
+                }
+                };
+
+            // bishops
+            for (uint64_t tmp = pm[off + 1]; tmp; tmp &= tmp - 1) {
+                const int sq = MaskToIndex(tmp);
+                const uint64_t atk = MagicBitboard::DiagonalAttacks(sq, occ);
+                am.byPiece[c][1] |= atk;
+
+                s += Score(
+                    PieceValues[1] + PieceSquareTables::PstMg(1, sq, black),
+                    PieceEgValues[1] + PieceSquareTables::PstEg(1, sq, black)
+                );
+
+                const int mob = LUTs::BishopMobilityScore[NumBitsOn(atk & area)];
+                s += Score(mob, mob);
+
+                noteZone(atk, 20);
+            }
+
+            if (NumBitsOn(pm[off + 1]) >= 2) s += Score(30, 30); // bishop pair
+
+            // knights
+            for (uint64_t tmp = pm[off + 2]; tmp; tmp &= tmp - 1) {
+                const int sq = MaskToIndex(tmp);
+                const uint64_t atk = LUTs::KnightAttacks[sq];
+                am.byPiece[c][2] |= atk;
+
+                s += Score(
+                    PieceValues[2] + PieceSquareTables::PstMg(2, sq, black),
+                    PieceEgValues[2] + PieceSquareTables::PstEg(2, sq, black)
+                );
+
+                const int mob = LUTs::KnightMobilityScore[NumBitsOn(atk & area)];
+                s += Score(mob, mob);
+
+                if (NumBitsOn(atk & forkTargets) >= 2 && !(enemyPawnAttacks & IndexToMask(sq))) s += Score(40, 40);
+
+                // outpost: on the enemy half, protected by a pawn and no enemy pawn can ever kick it
+                {
+                    const int adv = black ? ToRank(sq) : (Ranks - 1 - ToRank(sq));
+                    if (
+                        adv >= 3 && adv <= 5 &&
+                        (LUTs::PawnAttacks[e][sq] & pm[off]) &&
+                        !(LUTs::PassedPawn[c][sq] & LUTs::AdjacentFiles[ToFile(sq)] & pm[e * 6])
+                    ) {
+                        s += Score(22, 14);
+                    }
+                }
+
+                noteZone(atk, 20);
+            }
+
+            // rooks
+            for (uint64_t tmp = pm[off + 3]; tmp; tmp &= tmp - 1) {
+                const int sq = MaskToIndex(tmp);
+                const uint64_t atk = MagicBitboard::OrthogonalAttacks(sq, occ);
+                am.byPiece[c][3] |= atk;
+
+                s += Score(
+                    PieceValues[3] + PieceSquareTables::PstMg(3, sq, black),
+                    PieceEgValues[3] + PieceSquareTables::PstEg(3, sq, black)
+                );
+
+                const int mob = LUTs::RookMobilityScore[NumBitsOn(atk & area)];
+                s += Score(mob, mob);
+
+                // open / semi open file
+                const uint64_t file = Utils::FileMask(ToFile(sq));
+                const bool noMine = !(file & pm[off]);
+                const bool noOpp = !(file & pm[e * 6]);
+                if (noMine && noOpp) s += Score(20, 20);
+                else if (noMine) s += Score(10, 10);
+
+                noteZone(atk, 40);
+            }
+
+            // queens
+            for (uint64_t tmp = pm[off + 4]; tmp; tmp &= tmp - 1) {
+                const int sq = MaskToIndex(tmp);
+                const uint64_t atk = MagicBitboard::CombinedAttacks(sq, occ);
+                am.byPiece[c][4] |= atk;
+
+                s += Score(
+                    PieceValues[4] + PieceSquareTables::PstMg(4, sq, black),
+                    PieceEgValues[4] + PieceSquareTables::PstEg(4, sq, black)
+                );
+
+                const int mob = LUTs::QueenMobilityScore[NumBitsOn(atk & area)];
+                s += Score(mob, mob);
+
+                noteZone(atk, 80);
+            }
+
+            if (c == 0) total += s;
+            else total -= s;
+        }
+
+        for (int c = 0; c < 2; ++c) {
+            am.all[c] = am.byPiece[c][0] | am.byPiece[c][1] | am.byPiece[c][2] |
+                am.byPiece[c][3] | am.byPiece[c][4] | am.byPiece[c][5];
+        }
+
+        // ---- king danger and threats, from the point of view of the attacking side c ----
+        for (int c = 0; c < 2; ++c) {
+            const int e = c ^ 1;
+            const int off = c * 6;
+            const int eoff = e * 6;
+
+            Score s; // positive = good for c
+
+            {
+                // safe checks: squares from which one of our pieces could check the king that the
+                // enemy does not control
+                const uint64_t safe = ~colorOcc[c] & ~am.all[e];
+
+                const uint64_t knightChecks = LUTs::KnightAttacks[kingSq[e]];
+                const uint64_t bishopChecks = MagicBitboard::DiagonalAttacks(kingSq[e], occ);
+                const uint64_t rookChecks = MagicBitboard::OrthogonalAttacks(kingSq[e], occ);
+
+                if (am.byPiece[c][2] & knightChecks & safe) units[e] += 30;
+                if (am.byPiece[c][1] & bishopChecks & safe) units[e] += 20;
+                if (am.byPiece[c][3] & rookChecks & safe) units[e] += 40;
+                if (am.byPiece[c][4] & (bishopChecks | rookChecks) & safe) units[e] += 50;
+            }
+
+            int danger = units[e] * AttackerCountScaleNew[std::min(attackers[e], 8)] / 100 + zoneHits[e] * 2;
+
+            // without a queen an attack on the king is much less dangerous
+            if (!pm[off + 4]) danger /= 2;
+
+            danger = std::min(danger, 300);
+
+            total += (c == 0) ? Score(danger, 0) : Score(-danger, 0);
+
+            {
+                const uint64_t eMinors = pm[eoff + 1] | pm[eoff + 2];
+                const uint64_t eRooks = pm[eoff + 3];
+                const uint64_t eQueens = pm[eoff + 4];
+
+                const uint64_t pawnAtk = am.byPiece[c][0];
+                const uint64_t minorAtk = am.byPiece[c][1] | am.byPiece[c][2];
+                const uint64_t rookAtk = am.byPiece[c][3];
+
+                // pawns attacking pieces
+                s += Score(25, 15) * NumBitsOn(pawnAtk & eMinors);
+                s += Score(35, 20) * NumBitsOn(pawnAtk & eRooks);
+                s += Score(40, 20) * NumBitsOn(pawnAtk & eQueens);
+
+                // minors attacking rooks / queens, rooks attacking queens
+                s += Score(25, 15) * NumBitsOn(minorAtk & eRooks);
+                s += Score(30, 15) * NumBitsOn(minorAtk & eQueens);
+                s += Score(25, 15) * NumBitsOn(rookAtk & eQueens);
+
+                // pieces that are attacked and not defended at all
+                const uint64_t ePieces = eMinors | eRooks | eQueens;
+                s += Score(10, 6) * NumBitsOn(am.all[c] & ePieces & ~am.all[e]);
+            }
+
+            if (c == 0) total += s;
+            else total -= s;
+        }
+
+        return total;
     }
 
-    // bishop pair bonus
-    if (NumBitsOn(m_PieceMask[myOff + 1]) >= 2) material += 30;
-    if (NumBitsOn(m_PieceMask[oppOff + 1]) >= 2) material -= 30;
-
-    return material;
 }
 
 #pragma region Evaluation
 
 int Board::evaluate(PieceColor sideToMove, float endgameWeight) const noexcept {
-    const float earlyGameWeight = 1.f - endgameWeight;
-    const PieceColor opp = InvertColor(sideToMove);
+    const uint64_t occW = GetOccupancyMap(PieceColor::White);
+    const uint64_t occB = GetOccupancyMap(PieceColor::Black);
+    const uint64_t occ = occW | occB;
 
-    const uint64_t myOcc = GetOccupancyMap(sideToMove);
-    const uint64_t enemyOcc = GetOccupancyMap(opp);
-    const uint64_t occ = myOcc | enemyOcc;
+    // pawns + kings: cached. Nothing in the cached entry depends on other pieces or on the phase.
+    PawnTranspositionTable::PawnTTEntry pawnData;
 
-    return (
-        15 + // tempo bonus for being the side to move
-        evalCountMaterial(sideToMove, endgameWeight) +
-        (evalForceKingToCorner(sideToMove) - evalForceKingToCorner(opp)) * endgameWeight +
-        (evalKingDanger(opp, occ) - evalKingDanger(sideToMove, occ)) * earlyGameWeight +
-        (evalPawnShield(sideToMove) - evalPawnShield(opp)) * earlyGameWeight +
-        evalPawnStructure(sideToMove, occ, endgameWeight) +
-        evalMobility(sideToMove, myOcc, enemyOcc, occ, endgameWeight)
-    );
+    if (const auto* cached = GameContext::PawnTT.Probe(m_PawnAndKingHash)) {
+        pawnData = *cached;
+    } else {
+        pawnData = BuildPawnEntry(*this);
+        GameContext::PawnTT.Store(m_PawnAndKingHash, pawnData);
+    }
+
+    const bool whiteToMove = sideToMove == PieceColor::White;
+
+    Score total(pawnData.Mg, pawnData.Eg);
+    total += EvalPieces(*this, occW, occB, occ);
+    total += EvalPassers(*this, 0, pawnData.Passed[0], occ, !whiteToMove);
+    total -= EvalPassers(*this, 1, pawnData.Passed[1], occ, whiteToMove);
+
+    // interpolate between middlegame and endgame once
+    int v = static_cast<int>(static_cast<float>(total.mg) + static_cast<float>(total.eg - total.mg) * endgameWeight);
+
+    // endgame scaling: some material advantages do not win
+    if (v != 0) {
+        const int strong = v > 0 ? 0 : 1;
+        const int weak = strong ^ 1;
+
+        int scale = 64;
+
+        if (
+            !m_PieceMask[strong * 6] &&
+            NonPawnMaterial(m_PieceMask, strong) - NonPawnMaterial(m_PieceMask, weak) < 400
+        ) {
+            // no pawns to promote and less than a rook up: can't force mate
+            scale = m_PieceMask[weak * 6] ? 40 : 16;
+        } else if (!((m_PieceMask[2] | m_PieceMask[8]) | (m_PieceMask[4] | m_PieceMask[10]))) {
+            // (only reached without knights and queens, which is all the bishop check below needs)
+            const int strongPawns = NumBitsOn(m_PieceMask[strong * 6]);
+            const int weakPawns = NumBitsOn(m_PieceMask[weak * 6]);
+
+            const uint64_t sb = m_PieceMask[strong * 6 + 1];
+            const uint64_t wb = m_PieceMask[weak * 6 + 1];
+
+            const int strongRooks = NumBitsOn(m_PieceMask[strong * 6 + 3]);
+            const int weakRooks = NumBitsOn(m_PieceMask[weak * 6 + 3]);
+
+            // opposite colored bishops: drawish
+            if (
+                sb && wb && !(sb & (sb - 1)) && !(wb & (wb - 1)) &&
+                strongRooks == weakRooks && strongRooks <= 1 &&
+                IsLightSquare(MaskToIndex(sb)) != IsLightSquare(MaskToIndex(wb))
+            ) {
+                if (strongRooks == 0) scale = (strongPawns - weakPawns >= 3) ? 52 : 32;
+                else scale = 48;
+            }
+        }
+
+        v = v * scale / 64;
+    }
+
+    // when one side is clearly winning on material and the other has nothing to push, drive the
+    // lone king to the edge / corner and bring our own king closer. Only for the winning side.
+    for (int win = 0; win < 2; ++win) {
+        const int lose = win ^ 1;
+
+        if (
+            !m_PieceMask[lose * 6] &&
+            (m_PieceMask[win * 6 + 1] | m_PieceMask[win * 6 + 2] | m_PieceMask[win * 6 + 3] | m_PieceMask[win * 6 + 4]) &&
+            NonPawnMaterial(m_PieceMask, win) - NonPawnMaterial(m_PieceMask, lose) >= 400
+        ) {
+            const int loserKing = MaskToIndex(m_PieceMask[lose * 6 + 5]);
+            const int winnerKing = MaskToIndex(m_PieceMask[win * 6 + 5]);
+
+            const int rank = ToRank(loserKing);
+            const int file = ToFile(loserKing);
+
+            int cornerTerm = (std::max(3 - rank, rank - 4) + std::max(3 - file, file - 4)) * 10;
+
+            // bishop + knight can only mate in a corner that matches the bishop's color
+            if (
+                NumBitsOn(m_PieceMask[win * 6 + 1]) == 1 && NumBitsOn(m_PieceMask[win * 6 + 2]) == 1 &&
+                !(m_PieceMask[win * 6 + 3] | m_PieceMask[win * 6 + 4])
+            ) {
+                const bool light = IsLightSquare(MaskToIndex(m_PieceMask[win * 6 + 1]));
+                // a8 (0) and h1 (63) are light, h8 (7) and a1 (56) are dark
+                const int c1 = light ? 0 : 7;
+                const int c2 = light ? 63 : 56;
+                const int dist = std::min(ManhattanDist(loserKing, c1), ManhattanDist(loserKing, c2));
+
+                cornerTerm = (14 - dist) * 10;
+            }
+
+            const int drive = cornerTerm + (14 - ManhattanDist(loserKing, winnerKing)) * 5;
+            const int scaled = static_cast<int>(static_cast<float>(drive) * endgameWeight);
+
+            v += (win == 0) ? scaled : -scaled;
+        }
+    }
+
+    return 15 + (whiteToMove ? v : -v); // tempo bonus for being the side to move
 }
 
 int Board::evaluate(PieceColor sideToMove) const noexcept {
@@ -2606,10 +2933,10 @@ uint64_t Board::seeGetAllAttackers(
     uint64_t orthSliders, uint64_t kings, uint64_t occupancy
 ) const {
     return occupancy & (
-        // white pawns
-        (LUTs::PawnAttacks[0][pos] & m_PieceMask[0]) |
-        // black pawns
-        (LUTs::PawnAttacks[1][pos] & m_PieceMask[6]) |
+        // white pawns that attack `pos` stand where a *black* pawn on `pos` would attack
+        (LUTs::PawnAttacks[1][pos] & m_PieceMask[0]) |
+        // black pawns that attack `pos` stand where a *white* pawn on `pos` would attack
+        (LUTs::PawnAttacks[0][pos] & m_PieceMask[6]) |
         // knights
         (LUTs::KnightAttacks[pos] & knights) |
         // bishops / queens
@@ -2679,7 +3006,11 @@ int Board::see(Move move) const {
 
         if (!attacker) break;
 
-        gain[++depth] = PieceValues[static_cast<int>(lastMoved)] - gain[depth - 1];
+        // NOTE: must not be written as gain[++depth] = ... - gain[depth - 1]; in C++17 the right hand side
+        // is evaluated first so that would read gain[-1] on the first iteration
+        // a king may only capture last: give it a huge value so recapturing "into" a defended square never looks free
+        gain[depth + 1] = (lastMoved == PieceType::King ? 20000 : PieceValues[static_cast<int>(lastMoved)]) - gain[depth];
+        ++depth;
 
         // remove the attacker from occupancy
         occ &= ~attacker;
@@ -2734,9 +3065,11 @@ float Board::GetConfidence(PieceColor sideToMove, int thinkTimeMS) const {
 #pragma region Move Ranking
 
 int Board::scoreMove(Move move, PieceColor sideToMove) const noexcept {
-    int score = SearchContext::HistoryTable[move.StartingSquare * (Ranks * Files) + move.TargetSquare];
-
     const bool isCapture = HasFlag(move.Flag, MoveFlag::Capture);
+
+    // history is only meaningful for quiet moves, keep it out of capture / promotion ordering
+    int score = (isCapture || isPromotion(move.Flag))
+        ? 0 : SearchContext::HistoryTable[move.StartingSquare * (Ranks * Files) + move.TargetSquare];
 
     // 1. promotions (highest priority)
     if (isPromotion(move.Flag)) {
@@ -2780,14 +3113,24 @@ int Board::scoreMove(Move move, PieceColor sideToMove) const noexcept {
 #pragma region Quiescence
 
 int Board::quiescence(int alpha, int beta, PieceColor sideToMove, int ply) const {
-    const int standPat = evaluate(sideToMove);
+    // when in check standing pat is not allowed (we can't just "pass"), every evasion has to be searched
+    const bool inCheck = isUnderCheck(sideToMove);
+    int standPat = -INF;
 
-    if (standPat >= beta) return beta;
-    if (standPat > alpha) alpha = standPat;
+    if (!inCheck) {
+        standPat = evaluate(sideToMove);
+
+        if (standPat >= beta) return beta;
+        if (standPat > alpha) alpha = standPat;
+    }
 
     Move captureMoves[MaxLegalMoves];
     unsigned int numCaptures = 0u;
-    getAllCaptureMoves(sideToMove, captureMoves, numCaptures);
+
+    if (inCheck) getAllLegalMoves(sideToMove, captureMoves, numCaptures);
+    else getAllCaptureMoves(sideToMove, captureMoves, numCaptures);
+
+    if (inCheck && numCaptures == 0u) return ply - INF; // checkmate
 
     ScoredMove moves[MaxLegalMoves];
     unsigned int numMoves = 0u;
@@ -2795,17 +3138,22 @@ int Board::quiescence(int alpha, int beta, PieceColor sideToMove, int ply) const
     for (unsigned int i = 0u; i < numCaptures; ++i) {
         const Move move = captureMoves[i];
 
-        const PieceType victimType = HasFlag(move.Flag, MoveFlag::EnPassant)
-            ? PieceType::Pawn : m_Mailbox[move.TargetSquare].Type;
+        if (!inCheck) {
+            const PieceType victimType = HasFlag(move.Flag, MoveFlag::EnPassant)
+                ? PieceType::Pawn : m_Mailbox[move.TargetSquare].Type;
 
-        int gain = PieceValues[static_cast<int>(victimType)];
+            int gain = PieceValues[static_cast<int>(victimType)];
 
-        if (isPromotion(move.Flag)) {
-            gain += PieceValues[static_cast<int>(Utils::PromotionPiece(move.Flag))] - PieceValues[0];
+            if (isPromotion(move.Flag)) {
+                gain += PieceValues[static_cast<int>(Utils::PromotionPiece(move.Flag))] - PieceValues[0];
+            }
+
+            // delta pruning: skip if even a perfect capture can't raise alpha
+            if (standPat + gain + 200 < alpha) continue;
+
+            // captures that lose material by static exchange are almost never worth searching
+            if (!isPromotion(move.Flag) && see(move) < 0) continue;
         }
-
-        // delta pruning: skip if even a perfect capture can't raise alpha
-        if (standPat + gain + 200 < alpha) continue;
 
         moves[numMoves++] = ScoredMove(move, scoreMove(move, sideToMove));
     }
@@ -2873,6 +3221,9 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
     const bool inCheck = isUnderCheck(sideToMove);
     const float endgameWeight = getEndgameWeight();
 
+    // computed once and shared by every pruning heuristic below
+    const int staticEval = evaluate(sideToMove, endgameWeight);
+
     // null move pruning
     if (
         depth >= 3 &&
@@ -2914,7 +3265,7 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
 
             if (
                 !HasFlag(move.Flag, MoveFlag::Capture) ||
-                see(move) < probcutBeta - evaluate(sideToMove)
+                see(move) < probcutBeta - staticEval
             ) {
                 continue;
             }
@@ -2936,8 +3287,6 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
         !inCheck &&
         std::abs(beta) < MateThreshold
     ) {
-        const int staticEval = evaluate(sideToMove, endgameWeight);
-
         if (staticEval - 120 * depth >= beta) {
             return staticEval;
         }
@@ -3042,6 +3391,9 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
     int originalAlpha = alpha;
     Move bestMove;
 
+    Move quietsTried[MaxLegalMoves];
+    unsigned int numQuietsTried = 0u;
+
     for (unsigned int i = 0u; i < numMoves; ++i) {
         Move move = moves[i].Move;
 
@@ -3084,8 +3436,10 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
             int reduction = depthReduction(depth, i + 1);
 
             // reduce reduction for promising moves
-            if (const int histScore = SearchContext::HistoryTable[move.StartingSquare * (Ranks * Files) + move.TargetSquare]) {
-                reduction = std::max(1, reduction - histScore / 1000);
+            {
+                const int histScore = SearchContext::HistoryTable[move.StartingSquare * (Ranks * Files) + move.TargetSquare];
+                // good history -> reduce less, bad history -> reduce more
+                reduction = std::max(1, reduction - histScore / 4096);
             }
 
             score = -copy.negamax(nextDepth - reduction, -beta, -alpha, InvertColor(sideToMove), ply + 1, newExt);
@@ -3126,9 +3480,16 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
             alpha = score;
         }
 
+        if (
+            alpha < beta && numQuietsTried < MaxLegalMoves &&
+            !HasFlag(move.Flag, MoveFlag::Capture) &&
+            !HasFlag(move.Flag, MoveFlag::Check) &&
+            !isPromotion(move.Flag)
+        ) {
+            quietsTried[numQuietsTried++] = move;
+        }
+
         if (alpha >= beta) {
-            // update history if this move caused a beta cutoff
-            SearchContext::HistoryTable[move.StartingSquare * (Ranks * Files) + move.TargetSquare] += depth * depth;
 
             // what seemed like a quiet move, is actually killer
             if (
@@ -3136,6 +3497,15 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
                 !HasFlag(move.Flag, MoveFlag::Check) &&
                 !isPromotion(move.Flag)
             ) {
+                {
+                    const int bonus = std::min(depth * depth * 4, 1600);
+                    SearchContext::UpdateHistory(move.StartingSquare, move.TargetSquare, bonus);
+
+                    // quiet moves that were tried earlier and failed to cut get penalised
+                    for (unsigned int q = 0u; q < numQuietsTried; ++q) {
+                        SearchContext::UpdateHistory(quietsTried[q].StartingSquare, quietsTried[q].TargetSquare, -bonus);
+                    }
+                }
                 // add to the shift register
                 SearchContext::killerMoves[ply][1] = SearchContext::killerMoves[ply][0];
                 SearchContext::killerMoves[ply][0] = move;
