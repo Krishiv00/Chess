@@ -392,14 +392,40 @@ int UciHandler::computeThinkTime(const GoParams& params) const {
 
     const bool isBlack = m_SideToMove == Chess::PieceColor::Black;
 
-    const int remaining = isBlack ? params.Btime : params.Wtime;
-    if (remaining <= 0) return 100;
+    const int rawRemaining = isBlack ? params.Btime : params.Wtime;
+    const int increment = std::max(0, isBlack ? params.Binc : params.Winc);
 
-    const int increment = isBlack ? params.Binc : params.Winc;
+    if (rawRemaining < 0) {
+        return std::max<int>(Options::MinimumThinkingTime, 1000);
+    }
 
-    return std::clamp<int>(
-        remaining / 75 + static_cast<int>(increment * 0.6) - Options::MoveOverhead,
-        Options::MinimumThinkingTime,
-        remaining / 20
+    const int safetyReserve = std::clamp(rawRemaining / 20, 10, 1000);
+    const int remaining = std::max(0, rawRemaining - Options::MoveOverhead - safetyReserve);
+
+    if (remaining <= 0) {
+        return std::clamp(rawRemaining / 2, 1, 50);
+    }
+
+    int movesToGo;
+
+    if (params.Movestogo > 0) {
+        movesToGo = params.Movestogo;
+    } else {
+        const int movesPlayed = static_cast<int>(m_Board.GetMoveCount()) / 2;
+        movesToGo = std::max(50 - movesPlayed, 17);
+    }
+
+    movesToGo = std::max(movesToGo, 1);
+    const bool nearingControl = params.Movestogo > 0 && movesToGo <= 3;
+
+    const double idealMs = static_cast<double>(remaining) / (movesToGo + std::min(movesToGo, 5)) + increment * 0.75;
+    const double maxMs = remaining * (nearingControl ? 0.5 : 0.33) + increment * 0.5;
+
+    const int floorMs = std::min<int>(Options::MinimumThinkingTime, remaining / 4);
+
+    return std::clamp(
+        static_cast<int>(idealMs),
+        std::max(1, floorMs),
+        std::max(1, static_cast<int>(std::min<double>(maxMs, remaining)))
     );
 }

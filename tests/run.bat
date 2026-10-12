@@ -9,7 +9,7 @@ echo ==========================================
 echo.
 
 echo [1/2] Compiling test suite...
-g++ -std=c++23 -O2 -I../include tests.cpp ../src/Engine/Chess.cpp -o Test
+g++ -std=c++23 -O1 -pipe -I../include tests.cpp ../src/Engine/Chess.cpp -o Test
 
 if errorlevel 1 (
     echo.

@@ -20,7 +20,7 @@ private:
         int Btime{-1};
         int Winc{0};
         int Binc{0};
-        int Movestogo{30};
+        int Movestogo{0};
         int Movetime{-1};
         int Depth{-1};
         bool Perft{false};
