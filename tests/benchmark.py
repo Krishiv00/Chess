@@ -3,7 +3,6 @@
 import math
 import os
 import queue
-import random
 import shlex
 import threading
 import time
@@ -37,10 +36,9 @@ DEPTH = None
 ENGINE_OPTIONS = {
     "Hash": "32",
     "Threads": "1",
-    "OwnBook": "false",
+    "OwnBook": "true",
 }
 
-RANDOM_OPENING_PLIES = 4
 MAX_MOVES = 200
 SHOW_BOARD = True # render board in TUI
 CONFIDENCE = 0.95
@@ -127,16 +125,6 @@ def start_engine(path: str) -> chess.engine.SimpleEngine:
             engine.configure({name: value})
 
     return engine
-
-
-def random_opening(plies: int, rng: random.Random) -> chess.Board:
-    board = chess.Board()
-    for _ in range(plies):
-        if board.is_game_over():
-            break
-        legal = list(board.legal_moves)
-        board.push(rng.choice(legal))
-    return board
 
 
 def play_one_game(
@@ -407,11 +395,9 @@ def main() -> None:
     total_games = GAME_PAIRS * 2
     dashboard = Dashboard(stats, total_games)
 
-    rng = random.Random()
     work_q: "queue.Queue" = queue.Queue()
     for pair_index in range(GAME_PAIRS):
-        start_board = random_opening(RANDOM_OPENING_PLIES, rng)
-        work_q.put((pair_index, start_board))
+        work_q.put((pair_index, chess.Board()))
 
     workers = max(1, min(concurrency, GAME_PAIRS))
 
