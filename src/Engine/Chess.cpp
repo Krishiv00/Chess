@@ -6,6 +6,7 @@
 #include <chrono>
 #include <unordered_set>
 #include <array>
+#include <memory>
 
 #include "Engine/Chess.hpp"
 
@@ -71,6 +72,7 @@ namespace Utils {
 
 namespace Options {
     static int Contempt{50};
+    static int Threads{1};
 };
 
 #pragma region Hashing
@@ -201,41 +203,76 @@ public:
     };
 
     struct TTEntry {
-        uint32_t Key{0};
         int32_t Score{0};
         int8_t Depth{-1};
-        TTFlag NodeFlag;
+        TTFlag NodeFlag{TTFlag::Exact};
         uint8_t Age{0};
         TTMove BestMove;
     };
 
 private:
-    std::vector<TTEntry> m_Entries;
+
+    struct Slot {
+        std::atomic<uint64_t> Check{0};
+        std::atomic<uint64_t> Data{0};
+    };
+
+    std::unique_ptr<Slot[]> m_Slots;
+    std::size_t m_Count{0};
     uint8_t m_Age{0};
 
-    static constexpr inline uint32_t KeyCheck(uint64_t key) noexcept {
-        return static_cast<uint32_t>(key >> 32);
+    [[nodiscard]]
+    static constexpr uint64_t Pack(const TTEntry& e) noexcept {
+        return static_cast<uint64_t>(static_cast<uint32_t>(e.Score)) |
+            (static_cast<uint64_t>(e.BestMove.StartingSquare) << 32) |
+            (static_cast<uint64_t>(e.BestMove.TargetSquare) << 40) |
+            (static_cast<uint64_t>(static_cast<uint8_t>(e.Depth)) << 48) |
+            (static_cast<uint64_t>(static_cast<uint8_t>(e.NodeFlag) & 3u) << 56) |
+            (static_cast<uint64_t>(e.Age & 63u) << 58);
+    }
+
+    [[nodiscard]]
+    static constexpr TTEntry Unpack(uint64_t d) noexcept {
+        TTEntry e;
+        e.Score = static_cast<int32_t>(static_cast<uint32_t>(d & 0xFFFFFFFFull));
+        e.BestMove.StartingSquare = static_cast<uint8_t>((d >> 32) & 0xFF);
+        e.BestMove.TargetSquare = static_cast<uint8_t>((d >> 40) & 0xFF);
+        e.Depth = static_cast<int8_t>((d >> 48) & 0xFF);
+        e.NodeFlag = static_cast<TTFlag>((d >> 56) & 3u);
+        e.Age = static_cast<uint8_t>((d >> 58) & 63u);
+        return e;
     }
 
 public:
     void Clear() {
-        std::memset(m_Entries.data(), 0, m_Entries.size() * sizeof(TTEntry));
+        for (std::size_t i = 0; i < m_Count; ++i) {
+            m_Slots[i].Check.store(0, std::memory_order_relaxed);
+            m_Slots[i].Data.store(0, std::memory_order_relaxed);
+        }
     }
 
     // called once per new search so that entries from earlier searches can be replaced
     void NewSearch() noexcept {
-        ++m_Age;
+        m_Age = static_cast<uint8_t>((m_Age + 1) & 63u);
     }
 
-    const TTEntry* Peek(uint64_t key) const noexcept {
-        const TTEntry& e = m_Entries[key % m_Entries.size()];
-        return (e.Key == KeyCheck(key)) ? &e : nullptr;
+
+    bool Peek(uint64_t key, TTEntry& out) const noexcept {
+        if (!m_Count) return false;
+
+        const Slot& slot = m_Slots[key % m_Count];
+        const uint64_t data = slot.Data.load(std::memory_order_relaxed);
+        const uint64_t check = slot.Check.load(std::memory_order_relaxed);
+
+        if ((check ^ data) != key) return false;
+
+        out = Unpack(data);
+        return true;
     }
 
     bool Probe(uint64_t key, int depth, int alpha, int beta, int& score, Move& bestMove) const {
-        const TTEntry& entry = m_Entries[key % m_Entries.size()];
-
-        if (entry.Key != KeyCheck(key)) return false;
+        TTEntry entry;
+        if (!Peek(key, entry)) return false;
 
         // move isn't strict to depth since it's used for move ordering
         // even if it's not good it has a higher chance of being better than the other moves
@@ -263,22 +300,35 @@ public:
     }
 
     void Store(uint64_t key, int depth, int score, TTFlag flag, Move bestMove) {
-        TTEntry& entry = m_Entries[key % m_Entries.size()];
+        if (!m_Count) return;
+
+        Slot& slot = m_Slots[key % m_Count];
+        const TTEntry existing = Unpack(slot.Data.load(std::memory_order_relaxed));
 
         // replace if the slot is from an older search, or if the new result is at least as deep
-        if (entry.Age != m_Age || entry.Depth <= depth) {
-            entry = TTEntry(KeyCheck(key), score, static_cast<int8_t>(depth), flag, m_Age, TTMove(bestMove.StartingSquare, bestMove.TargetSquare));
+        if (existing.Age != m_Age || existing.Depth <= depth) {
+            TTEntry e;
+            e.Score = score;
+            e.Depth = static_cast<int8_t>(depth);
+            e.NodeFlag = flag;
+            e.Age = m_Age;
+            e.BestMove = TTMove(bestMove.StartingSquare, bestMove.TargetSquare);
+
+            const uint64_t data = Pack(e);
+            slot.Data.store(data, std::memory_order_relaxed);
+            slot.Check.store(key ^ data, std::memory_order_relaxed);
         }
     }
 
     void SetSize(unsigned int sizeMb) {
-        m_Entries.resize((sizeMb * 1024 * 1024) / sizeof(TTEntry));
+        m_Count = std::max<std::size_t>(1, (static_cast<std::size_t>(sizeMb) * 1024 * 1024) / sizeof(Slot));
+        m_Slots.reset(new Slot[m_Count]);
         Clear();
     }
 
     [[nodiscard]]
     inline unsigned int GetSize() const noexcept {
-        return (m_Entries.size() * sizeof(TTEntry)) / 1024 / 1024;
+        return static_cast<unsigned int>((m_Count * sizeof(Slot)) / 1024 / 1024);
     }
 };
 
@@ -625,20 +675,51 @@ struct GameContext {
     }
 
     static inline TranspositionTable TT;
-    static inline PawnTranspositionTable PawnTT;
     static inline std::vector<uint64_t> GameHistory;
     static inline uint16_t MoveCount;
 };
 
+namespace SearchLimits {
+    constexpr inline int MaxPly = 256;
+}
+
+struct SearchThreadData {
+    int32_t HistoryTable[Ranks * Files * Ranks * Files]{};
+    uint64_t PositionHistory[SearchLimits::MaxPly]{};
+    Move killerMoves[SearchLimits::MaxPly][2];
+    Move ExcludedMove[SearchLimits::MaxPly];
+    PawnTranspositionTable PawnTT;
+};
+
 struct SearchContext {
+    // maximum ply that can be reached
+    static constexpr inline const int MaxPly = SearchLimits::MaxPly;
+    // maximum number of legal moves
+    static constexpr inline const int MaxMoves = 256;
+    // maximum number of ply extensions allowed
+    static constexpr inline const int MaxExt = 6;
+    static constexpr inline int MaxHistory = 16384;
+
+    using ThreadData = SearchThreadData;
+
+    static inline ThreadData MainData;
+    static inline thread_local ThreadData* Tls = &MainData;
+
+    [[nodiscard]]
+    static inline ThreadData& Data() noexcept {
+        return *Tls;
+    }
+
     static inline void BeginNew(uint64_t currentHash) {
-        for (auto& h : HistoryTable) h /= 2;
+        ThreadData& d = Data();
 
-        std::memset(killerMoves, 0, sizeof(killerMoves));
-        std::memset(PositionHistory, 0, sizeof(PositionHistory));
-        std::memset(ExcludedMove, 0, sizeof(ExcludedMove));
+        for (auto& h : d.HistoryTable) h /= 2;
 
-        PositionHistory[0] = currentHash;
+        std::memset(d.killerMoves, 0, sizeof(d.killerMoves));
+        std::memset(d.PositionHistory, 0, sizeof(d.PositionHistory));
+        std::memset(d.ExcludedMove, 0, sizeof(d.ExcludedMove));
+
+        d.PositionHistory[0] = currentHash;
 
         GameContext::TT.NewSearch();
 
@@ -647,27 +728,15 @@ struct SearchContext {
 
     static inline std::atomic<bool> Cancelled;
 
-    // maximum ply that can be reached
-    static constexpr inline const int MaxPly = 256;
-    // maximum number of legal moves
-    static constexpr inline const int MaxMoves = 256;
-    // maximum number of ply extensions allowed
-    static constexpr inline const int MaxExt = 6;
-
-    static inline int32_t HistoryTable[Ranks * Files * Ranks * Files];
-    static constexpr inline int MaxHistory = 16384;
-
     static inline void UpdateHistory(int from, int to, int bonus) noexcept {
-        int32_t& h = HistoryTable[from * (Ranks * Files) + to];
+        int32_t& h = Data().HistoryTable[from * (Ranks * Files) + to];
         h += bonus - h * std::abs(bonus) / MaxHistory;
     }
 
-    static inline uint64_t PositionHistory[MaxPly];
-    static inline Move killerMoves[MaxPly][2];
-    static inline Move ExcludedMove[MaxPly];
-
     static inline bool CatchAllMode{false};
-    static inline PieceColor EnginePlayer;
+    static inline PieceColor EnginePlayer{PieceColor::White};
+
+    static inline PieceColor RootSide{PieceColor::White};
 };
 
 #pragma region Scoring
@@ -945,14 +1014,15 @@ void Chess::Init() {
     MagicBitboard::Init();
     LUTs::Init();
 
-    GameContext::TT.SetSize(64);
+    GameContext::TT.SetSize(128);
+    Options::Threads = 4;
 }
 
 void Chess::Board::NewGame() {
     GameContext::TT.Clear();
-    GameContext::PawnTT.Clear();
+    SearchContext::MainData.PawnTT.Clear();
 
-    std::memset(SearchContext::HistoryTable, 0, sizeof(SearchContext::HistoryTable));
+    std::memset(SearchContext::Data().HistoryTable, 0, sizeof(SearchContext::Data().HistoryTable));
 }
 
 #pragma region Fen String
@@ -1181,7 +1251,7 @@ bool Board::isThreefoldRepetition(int ply) const {
     for (int i = ply - 2; i >= 0; i -= 2) {
         // intentionally used threshold of 2 here instead of 3 to avoid repetitions in search
         // with the value of 3, the engine sometimes did get stuck in a repetition loop
-        if (SearchContext::PositionHistory[i] == m_Hash && ++count >= 2) return true;
+        if (SearchContext::Data().PositionHistory[i] == m_Hash && ++count >= 2) return true;
     }
 
     // check game history
@@ -2136,14 +2206,22 @@ void Chess::Board::SetContempt(int contempt) const {
     Options::Contempt = contempt;
 }
 
+void Chess::Board::SetThreads(unsigned int threads) const {
+    Options::Threads = static_cast<int>(std::clamp<unsigned int>(threads, 1u, 128u));
+}
+
+unsigned int Chess::Board::GetThreads() const noexcept {
+    return static_cast<unsigned int>(Options::Threads);
+}
+
 void Chess::Board::SetHashSize(unsigned int size) const {
     GameContext::TT.SetSize(size);
-    GameContext::PawnTT.SetSize(std::max<int>(1, size / 64));
+    SearchContext::MainData.PawnTT.SetSize(std::max<int>(1, size / 64));
 }
 
 void Chess::Board::ClearHash() const {
     GameContext::TT.Clear();
-    GameContext::PawnTT.Clear();
+    SearchContext::MainData.PawnTT.Clear();
 }
 
 unsigned int Chess::Board::GetHashSize() const noexcept {
@@ -2369,6 +2447,7 @@ float Board::getEndgameWeight() const {
 #pragma region Eval Helpers
 
 namespace {
+
     struct Score {
         int mg{0};
         int eg{0};
@@ -2387,11 +2466,9 @@ namespace {
     constexpr Score operator+(Score a, const Score& b) noexcept {
         return a += b;
     }
-
     constexpr Score operator-(Score a, const Score& b) noexcept {
         return a -= b;
     }
-
     constexpr Score operator*(const Score& a, int k) noexcept {
         return Score(a.mg * k, a.eg * k);
     }
@@ -2825,11 +2902,13 @@ int Board::evaluate(PieceColor sideToMove, float endgameWeight) const noexcept {
     // pawns + kings: cached. Nothing in the cached entry depends on other pieces or on the phase.
     PawnTranspositionTable::PawnTTEntry pawnData;
 
-    if (const auto* cached = GameContext::PawnTT.Probe(m_PawnAndKingHash)) {
+    PawnTranspositionTable& pawnTT = SearchContext::Data().PawnTT;
+
+    if (const auto* cached = pawnTT.Probe(m_PawnAndKingHash)) {
         pawnData = *cached;
     } else {
         pawnData = BuildPawnEntry(*this);
-        GameContext::PawnTT.Store(m_PawnAndKingHash, pawnData);
+        pawnTT.Store(m_PawnAndKingHash, pawnData);
     }
 
     const bool whiteToMove = sideToMove == PieceColor::White;
@@ -3033,6 +3112,7 @@ int Board::see(Move move) const {
 
 float Board::GetConfidence(PieceColor sideToMove, int thinkTimeMS) const {
     SearchContext::BeginNew(m_Hash);
+    SearchContext::RootSide = sideToMove;
 
     // cancel search after time limit expires
     std::thread timerThread([thinkTimeMS]() {
@@ -3069,7 +3149,7 @@ int Board::scoreMove(Move move, PieceColor sideToMove) const noexcept {
 
     // history is only meaningful for quiet moves, keep it out of capture / promotion ordering
     int score = (isCapture || isPromotion(move.Flag))
-        ? 0 : SearchContext::HistoryTable[move.StartingSquare * (Ranks * Files) + move.TargetSquare];
+        ? 0 : SearchContext::Data().HistoryTable[move.StartingSquare * (Ranks * Files) + move.TargetSquare];
 
     // 1. promotions (highest priority)
     if (isPromotion(move.Flag)) {
@@ -3203,7 +3283,12 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
         HasInsufficientMaterial()
     ) {
         // penalize draws more when we have an advantage
-        return -std::clamp(Options::Contempt + evaluate(sideToMove) / 20, -200, 200);
+        const int stmEval = evaluate(sideToMove);
+        const bool engineToMove = sideToMove == SearchContext::RootSide;
+        const int engineEval = engineToMove ? stmEval : -stmEval;
+        const int drawForEngine = -std::clamp(Options::Contempt + engineEval / 20, -200, 200);
+
+        return engineToMove ? drawForEngine : -drawForEngine;
     }
 
     Move ttMove;
@@ -3301,15 +3386,17 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
         ttMove &&
         !inCheck
     ) {
-        if (const auto* entry = GameContext::TT.Peek(m_Hash)) {
-            if (
-                entry->Depth >= depth - 3 &&
-                entry->NodeFlag != TranspositionTable::TTFlag::UpperBound &&
-                std::abs(entry->Score) < MateThreshold
-            ) {
-                const int singularBeta = entry->Score - 2 * depth;
+        TranspositionTable::TTEntry entry;
 
-                SearchContext::ExcludedMove[ply] = ttMove;
+        if (GameContext::TT.Peek(m_Hash, entry)) {
+            if (
+                entry.Depth >= depth - 3 &&
+                entry.NodeFlag != TranspositionTable::TTFlag::UpperBound &&
+                std::abs(entry.Score) < MateThreshold
+            ) {
+                const int singularBeta = entry.Score - 2 * depth;
+
+                SearchContext::Data().ExcludedMove[ply] = ttMove;
 
                 const int singularScore = negamax(
                     depth / 2, singularBeta - 1, singularBeta, sideToMove, ply, ext + 1
@@ -3319,7 +3406,7 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
                     singularExtension = 1;
                 }
 
-                SearchContext::ExcludedMove[ply] = Move();
+                SearchContext::Data().ExcludedMove[ply] = Move();
             }
         }
     }
@@ -3336,7 +3423,7 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
         for (unsigned int i = 0u; i < numLegal; ++i) {
             const Move move = legalMoves[i];
 
-            if (move == SearchContext::ExcludedMove[ply]) continue;
+            if (move == SearchContext::Data().ExcludedMove[ply]) continue;
 
             int moveScore = scoreMove(move, sideToMove);
 
@@ -3351,8 +3438,8 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
                 !HasFlag(move.Flag, MoveFlag::Check) &&
                 !isPromotion(move.Flag)
             ) {
-                if (move == SearchContext::killerMoves[ply][0]) moveScore += 5000;
-                if (move == SearchContext::killerMoves[ply][1]) moveScore += 4000;
+                if (move == SearchContext::Data().killerMoves[ply][0]) moveScore += 5000;
+                if (move == SearchContext::Data().killerMoves[ply][1]) moveScore += 4000;
             }
 
             moves[numMoves++] = ScoredMove(move, moveScore);
@@ -3360,7 +3447,7 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
     }
 
     if (numMoves == 0u) {
-        if (SearchContext::ExcludedMove[ply]) {
+        if (SearchContext::Data().ExcludedMove[ply]) {
             return alpha;
         }
 
@@ -3414,7 +3501,7 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
         Board copy = *this;
         copy.doMoveInternal(move);
 
-        SearchContext::PositionHistory[ply + 1] = copy.m_Hash;
+        SearchContext::Data().PositionHistory[ply + 1] = copy.m_Hash;
 
         int extension = 0;
         if (ext < SearchContext::MaxExt) {
@@ -3437,7 +3524,7 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
 
             // reduce reduction for promising moves
             {
-                const int histScore = SearchContext::HistoryTable[move.StartingSquare * (Ranks * Files) + move.TargetSquare];
+                const int histScore = SearchContext::Data().HistoryTable[move.StartingSquare * (Ranks * Files) + move.TargetSquare];
                 // good history -> reduce less, bad history -> reduce more
                 reduction = std::max(1, reduction - histScore / 4096);
             }
@@ -3507,8 +3594,8 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
                     }
                 }
                 // add to the shift register
-                SearchContext::killerMoves[ply][1] = SearchContext::killerMoves[ply][0];
-                SearchContext::killerMoves[ply][0] = move;
+                SearchContext::Data().killerMoves[ply][1] = SearchContext::Data().killerMoves[ply][0];
+                SearchContext::Data().killerMoves[ply][0] = move;
             }
 
             break;
@@ -3524,7 +3611,7 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
     if (bestScore > MateThreshold) ttStoreScore = bestScore + ply;
     if (bestScore < -MateThreshold) ttStoreScore = bestScore - ply;
 
-    if (!SearchContext::ExcludedMove[ply]) {
+    if (!SearchContext::Data().ExcludedMove[ply]) {
         GameContext::TT.Store(m_Hash, depth, ttStoreScore, flag, bestMove);
     }
 
@@ -3535,12 +3622,138 @@ int Board::evaluateMove(Move move, PieceColor sideToMove, int depth, int alpha, 
     Board copy = *this;
     copy.doMoveInternal(move);
 
-    SearchContext::PositionHistory[1] = copy.m_Hash;
+    SearchContext::Data().PositionHistory[1] = copy.m_Hash;
 
     return -copy.negamax(depth - 1, -beta, -alpha, InvertColor(sideToMove));
 }
 
 #pragma region Find By Time
+
+void Board::searchHelper(PieceColor sideToMove, int helperId) const {
+    // depth skipping pattern, same idea as used by other Lazy SMP engines
+    static constexpr int SkipSize[20] = {1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4};
+    static constexpr int SkipPhase[20] = {0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7};
+
+    auto data = std::make_unique<SearchContext::ThreadData>();
+    SearchContext::Tls = data.get();
+
+    data->PawnTT.SetSize(std::max(1u, SearchContext::MainData.PawnTT.GetSize()));
+    data->PositionHistory[0] = m_Hash;
+
+    ScoredMove allMoves[MaxLegalMoves];
+    unsigned int numMoves = 0u;
+
+    {
+        Move legalMoves[MaxLegalMoves];
+        getAllLegalMoves(sideToMove, legalMoves, numMoves);
+
+        for (unsigned int i = 0u; i < numMoves; ++i) {
+            allMoves[i] = ScoredMove(legalMoves[i], scoreMove(legalMoves[i], sideToMove));
+        }
+    }
+
+    if (numMoves > 1u) {
+        std::sort(allMoves, allMoves + numMoves,
+            [](const ScoredMove& a, const ScoredMove& b) {
+                return a.Score > b.Score;
+            }
+        );
+
+        const int idx = (helperId - 1) % 20;
+        int bestScore = -INF;
+
+        for (int depth = 1; depth <= 96 && !SearchContext::Cancelled.load(std::memory_order_relaxed); ++depth) {
+            if (((depth + SkipPhase[idx]) / SkipSize[idx]) % 2) continue;
+
+            Move iterationBestMove = allMoves[0].Move;
+            int iterationBestScore = -INF;
+
+            int aspirationDelta = 50;
+            int aspirationAlpha = (depth >= 4 && bestScore > -INF) ? bestScore - aspirationDelta : -INF;
+            int aspirationBeta = (depth >= 4 && bestScore < INF) ? bestScore + aspirationDelta : INF;
+
+            bool cancelled = false;
+
+            while (true) {
+                int alpha = aspirationAlpha;
+                iterationBestScore = -INF;
+
+                for (unsigned int i = 0u; i < numMoves; ++i) {
+                    const Move move = allMoves[i].Move;
+                    const int score = evaluateMove(move, sideToMove, depth, alpha, aspirationBeta);
+
+                    if (SearchContext::Cancelled.load(std::memory_order_relaxed)) {
+                        cancelled = true;
+                        break;
+                    }
+
+                    if (score > iterationBestScore) {
+                        iterationBestScore = score;
+                        iterationBestMove = move;
+                    }
+
+                    if (score > alpha) alpha = score;
+                }
+
+                if (cancelled) break;
+
+                if (iterationBestScore <= aspirationAlpha) {
+                    aspirationAlpha -= aspirationDelta;
+                    aspirationDelta *= 2;
+                } else if (iterationBestScore >= aspirationBeta) {
+                    aspirationBeta += aspirationDelta;
+                    aspirationDelta *= 2;
+                } else {
+                    break;
+                }
+            }
+
+            if (cancelled) break;
+
+            bestScore = iterationBestScore;
+
+            // search the best move first on the next iteration
+            auto it = std::find_if(allMoves, allMoves + numMoves,
+                [&](const ScoredMove& sm) {
+                    return sm.Move == iterationBestMove;
+                }
+            );
+
+            if (it != allMoves && it != allMoves + numMoves) {
+                std::iter_swap(allMoves, it);
+            }
+        }
+    }
+
+    SearchContext::Tls = &SearchContext::MainData;
+}
+
+namespace {
+    std::vector<std::thread> StartHelperThreads(const Board& root, PieceColor sideToMove) {
+        std::vector<std::thread> helpers;
+
+        const int count = std::clamp(Options::Threads, 1, 128) - 1;
+        helpers.reserve(count);
+
+        for (int i = 1; i <= count; ++i) {
+            helpers.emplace_back([root, sideToMove, i]() {
+                root.searchHelper(sideToMove, i);
+            });
+        }
+
+        return helpers;
+    }
+
+    void StopHelperThreads(std::vector<std::thread>& helpers) {
+        SearchContext::Cancelled.store(true, std::memory_order_relaxed);
+
+        for (std::thread& t : helpers) {
+            if (t.joinable()) t.join();
+        }
+
+        helpers.clear();
+    }
+}
 
 Move Board::FindBestMoveByTime(PieceColor sideToMove, int thinkTimeMS, bool useOpeningBook) const {
     // try opening book first
@@ -3554,6 +3767,7 @@ Move Board::FindBestMoveByTime(PieceColor sideToMove, int thinkTimeMS, bool useO
 
     // begin new search
     SearchContext::BeginNew(m_Hash);
+    SearchContext::RootSide = sideToMove;
 
     // collect all moves
     ScoredMove allMoves[MaxLegalMoves];
@@ -3595,6 +3809,8 @@ Move Board::FindBestMoveByTime(PieceColor sideToMove, int thinkTimeMS, bool useO
 
         SearchContext::Cancelled.store(true, std::memory_order_relaxed);
     });
+
+    std::vector<std::thread> helperThreads = StartHelperThreads(*this, sideToMove);
 
     // iterative deepening
     for (int depth = 1; !SearchContext::Cancelled.load(std::memory_order_relaxed); ++depth) {
@@ -3663,6 +3879,7 @@ Move Board::FindBestMoveByTime(PieceColor sideToMove, int thinkTimeMS, bool useO
         }
     }
 
+    StopHelperThreads(helperThreads);
     timerThread.join();
 
     return bestMove;
@@ -3682,6 +3899,7 @@ Move Board::FindBestMoveByDepth(PieceColor sideToMove, int targetDepth, bool use
 
     // begin new search
     SearchContext::BeginNew(m_Hash);
+    SearchContext::RootSide = sideToMove;
 
     // collect all legal moves
     ScoredMove allMoves[MaxLegalMoves];
@@ -3711,6 +3929,8 @@ Move Board::FindBestMoveByDepth(PieceColor sideToMove, int targetDepth, bool use
 
     Move bestMove = allMoves[0].Move;
     int bestScore = -INF;
+
+    std::vector<std::thread> helperThreads = StartHelperThreads(*this, sideToMove);
 
     // iterative deepening
     for (int depth = 1; depth <= targetDepth && !SearchContext::Cancelled.load(std::memory_order_relaxed); ++depth) {
@@ -3775,6 +3995,8 @@ Move Board::FindBestMoveByDepth(PieceColor sideToMove, int targetDepth, bool use
             std::iter_swap(allMoves, it);
         }
     }
+
+    StopHelperThreads(helperThreads);
 
     return bestMove;
 }

@@ -53,7 +53,8 @@ void UciHandler::command_uci() const {
     Options::OwnBook = true;
     Options::MoveOverhead = 10;
     Options::MinimumThinkingTime = 30;
-    m_Board.SetHashSize(64);
+    m_Board.SetHashSize(128);
+    m_Board.SetThreads(1);
 
     std::cout
         // Bio
@@ -61,7 +62,7 @@ void UciHandler::command_uci() const {
         << "id author Krishiv" << std::endl
         // Expose options
         << "option name Move Overhead type spin default " << Options::MoveOverhead << " min 0 max 500" << std::endl
-        << "option name Threads type spin default 1 min 1 max 4" << std::endl
+        << "option name Threads type spin default " << m_Board.GetThreads() << " min 1 max 4" << std::endl
         << "option name Hash type spin default " << m_Board.GetHashSize() << " min 1 max 1024" << std::endl
         << "option name SyzygyPath type string default <empty>" << std::endl
         << "option name UCI_ShowWDL type check default false" << std::endl
@@ -221,6 +222,10 @@ void UciHandler::command_setoption(const std::string& command) {
     // apply options
     if (name == "Hash") {
         m_Board.SetHashSize(std::stoi(value));
+    }
+
+    else if (name == "Threads") {
+        m_Board.SetThreads(std::stoi(value));
     }
 
     else if (name == "Ponder") {

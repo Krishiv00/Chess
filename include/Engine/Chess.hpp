@@ -291,6 +291,8 @@ namespace Chess {
 
         void doMoveInternal(Move move);
 
+        void searchHelper(PieceColor sideToMove, int helperId) const;
+
         [[nodiscard]]
         float getEndgameWeight() const;
 
@@ -396,6 +398,11 @@ namespace Chess {
         uint64_t GetOccupancyMap() const noexcept;
 
         void SetContempt(int contempt) const;
+
+        void SetThreads(unsigned int threads) const;
+
+        [[nodiscard]]
+        unsigned int GetThreads() const noexcept;
 
         void SetHashSize(unsigned int size) const;
 
