@@ -49,10 +49,11 @@ void UciHandler::command_stop() {
 }
 
 void UciHandler::command_uci() const {
-    Options::Ponder = true;
+    Options::Ponder = false;
     Options::OwnBook = true;
     Options::MoveOverhead = 10;
     Options::MinimumThinkingTime = 30;
+
     m_Board.SetHashSize(128);
     m_Board.SetThreads(1);
 

@@ -724,6 +724,7 @@ struct SearchContext {
         GameContext::TT.NewSearch();
 
         Cancelled.store(false, std::memory_order_relaxed);
+        ResetStats();
     }
 
     static inline std::atomic<bool> Cancelled;
@@ -737,6 +738,21 @@ struct SearchContext {
     static inline PieceColor EnginePlayer{PieceColor::White};
 
     static inline PieceColor RootSide{PieceColor::White};
+
+    static inline std::atomic<uint64_t> Nodes{0};
+    static inline std::atomic<int> SelDepth{0};
+
+    static inline void ResetStats() {
+        Nodes.store(0, std::memory_order_relaxed);
+        SelDepth.store(0, std::memory_order_relaxed);
+    }
+
+    static inline void CountNode(int ply) noexcept {
+        Nodes.fetch_add(1, std::memory_order_relaxed);
+
+        int prevMax = SelDepth.load(std::memory_order_relaxed);
+        while (ply > prevMax && !SelDepth.compare_exchange_weak(prevMax, ply, std::memory_order_relaxed));
+    }
 };
 
 #pragma region Scoring
@@ -3192,6 +3208,8 @@ int Board::scoreMove(Move move, PieceColor sideToMove) const noexcept {
 #pragma region Quiescence
 
 int Board::quiescence(int alpha, int beta, PieceColor sideToMove, int ply) const {
+    SearchContext::CountNode(ply);
+
     // when in check standing pat is not allowed (we can't just "pass"), every evasion has to be searched
     const bool inCheck = isUnderCheck(sideToMove);
     int standPat = -INF;
@@ -3270,6 +3288,8 @@ static inline int depthReduction(int ply, int moveNumber) noexcept {
 
 int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int ply, int ext) const {
     if (SearchContext::Cancelled.load(std::memory_order_relaxed)) return SearchCancelScore;
+
+    SearchContext::CountNode(ply);
 
     if (depth <= 0) {
         return quiescence(alpha, beta, sideToMove, ply + 1);
@@ -3752,6 +3772,35 @@ namespace {
 
         helpers.clear();
     }
+
+    void PrintUciInfo(
+        int depth, int score, const Move& bestMove,
+        const std::chrono::steady_clock::time_point& searchStart
+    ) {
+        const int selDepth = SearchContext::SelDepth.load(std::memory_order_relaxed);
+        const uint64_t nodes = SearchContext::Nodes.load(std::memory_order_relaxed);
+
+        const auto elapsedMs = std::max<int64_t>(
+            1,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - searchStart
+            ).count()
+        );
+
+        const uint64_t nps = nodes * 1000ull / static_cast<uint64_t>(elapsedMs);
+
+        std::cout << "info" << " depth " << depth << " seldepth " << selDepth << " score ";
+
+        if (score > MateThreshold) {
+            std::cout << "mate " << ((INF - score) / 2 + 1);
+        } else if (score < -MateThreshold) {
+            std::cout << "mate " << (-(INF + score) / 2 - 1);
+        } else {
+            std::cout << "cp " << score;
+        }
+
+        std::cout << " nodes " << nodes << " nps " << nps << " time " << elapsedMs << " pv " << MoveToUCI(bestMove) << std::endl;
+    }
 }
 
 Move Board::FindBestMoveByTime(PieceColor sideToMove, int thinkTimeMS, bool useOpeningBook) const {
@@ -3796,6 +3845,8 @@ Move Board::FindBestMoveByTime(PieceColor sideToMove, int thinkTimeMS, bool useO
 
     Move bestMove = allMoves[0].Move;
     int bestScore = -INF;
+
+    const auto searchStart = std::chrono::steady_clock::now();
 
     // cancel search after time limit expires
     std::thread timerThread([thinkTimeMS]() {
@@ -3866,6 +3917,8 @@ Move Board::FindBestMoveByTime(PieceColor sideToMove, int thinkTimeMS, bool useO
         bestMove = iterationBestMove;
         bestScore = iterationBestScore;
 
+        PrintUciInfo(depth, bestScore, bestMove, searchStart);
+
         // reorder so the best move is searched first next iteration
         auto it = std::find_if(allMoves, allMoves + numMoves,
             [&](const ScoredMove& sm) {
@@ -3929,6 +3982,8 @@ Move Board::FindBestMoveByDepth(PieceColor sideToMove, int targetDepth, bool use
     Move bestMove = allMoves[0].Move;
     int bestScore = -INF;
 
+    const auto searchStart = std::chrono::steady_clock::now();
+
     std::vector<std::thread> helperThreads = StartHelperThreads(*this, sideToMove);
 
     // iterative deepening
@@ -3980,8 +4035,12 @@ Move Board::FindBestMoveByDepth(PieceColor sideToMove, int targetDepth, bool use
             if (SearchContext::Cancelled.load(std::memory_order_relaxed)) break;
         }
 
+        if (SearchContext::Cancelled.load(std::memory_order_relaxed)) break;
+
         bestMove = iterationBestMove;
         bestScore = iterationBestScore;
+
+        PrintUciInfo(depth, bestScore, bestMove, searchStart);
 
         // reorder so the best move is searched first next iteration
         auto it = std::find_if(allMoves, allMoves + numMoves,
