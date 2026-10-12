@@ -1015,7 +1015,6 @@ void Chess::Init() {
     LUTs::Init();
 
     GameContext::TT.SetSize(128);
-    Options::Threads = 4;
 }
 
 void Chess::Board::NewGame() {
