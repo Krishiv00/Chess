@@ -34,6 +34,12 @@ CONCURRENCY = None
 MOVETIME_MS = 50 # ms
 DEPTH = None
 
+ENGINE_OPTIONS = {
+    "Hash": "32",
+    "Threads": "1",
+    "OwnBook": "false",
+}
+
 RANDOM_OPENING_PLIES = 4
 MAX_MOVES = 200
 SHOW_BOARD = True # render board in TUI
@@ -114,7 +120,13 @@ def make_limit() -> chess.engine.Limit:
 
 def start_engine(path: str) -> chess.engine.SimpleEngine:
     cmd = shlex.split(path) if " " in path else path
-    return chess.engine.SimpleEngine.popen_uci(cmd)
+    engine = chess.engine.SimpleEngine.popen_uci(cmd)
+
+    for name, value in ENGINE_OPTIONS.items():
+        if name in engine.options:
+            engine.configure({name: value})
+
+    return engine
 
 
 def random_opening(plies: int, rng: random.Random) -> chess.Board:
