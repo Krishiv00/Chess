@@ -1,4 +1,4 @@
-# ♟ Chess++
+# ♟ Chess++ (~2300 Elo)
 
 A high-performance chess engine written from scratch in **C++**, featuring a bitboard-based move generator, advanced search techniques, and multiple interfaces:
 
@@ -49,7 +49,7 @@ This design balances performance in move generation with simplicity in move exec
 
 # Search
 
-The engine uses a **negamax alpha-beta search** with iterative deepening.
+The engine uses a **negamax alpha-beta search** with iterative deepening, and supports **multithreaded search (Lazy SMP)**.
 
 Enhancements include:
 
@@ -60,11 +60,12 @@ Enhancements include:
 * late move reductions (LMR) with history-based reduction adjustments
 * late move pruning
 * singular extensions
-* quiescence search with delta pruning
+* quiescence search with SEE and delta pruning
 * move ordering using history heuristics, killer moves, and transposition table entries
-* transposition table with depth-preferred replacement
+* lock-free transposition table, shared across search threads
 * repetition detection
 * pondering (background thinking)
+* multithreaded search (Lazy SMP)
 
 These techniques significantly reduce the search space and improve playing strength.
 
@@ -77,10 +78,13 @@ Positions are scored using a **tapered evaluation model** that smoothly interpol
 Key factors include:
 
 * material balance with piece-square tables
-* king safety (pawn shield, king danger from attacking pieces)
-* pawn structure (passed pawns, doubled pawns, isolated pawns, connected passed pawns)
-* piece mobility (knights, bishops, rooks, queens)
+* king safety (pawn shield, open files, king danger from attacking pieces, safe checks)
+* pawn structure (passed, doubled, isolated, backward, supported, and connected passed pawns)
+* passed pawn evaluation (king proximity, rule of the square)
+* piece mobility (knights, bishops, rooks, queens), restricted to safe squares
+* threat detection (attacked and undefended pieces, forks, outposts)
 * endgame-specific evaluation (king centralization, forcing opponent king to corners)
+* endgame scaling for drawish material imbalances (e.g. opposite-colored bishops)
 * rook placement (open and semi-open files)
 * bishop pair bonus
 * tempo bonus
@@ -161,7 +165,13 @@ The engine implements all **mandatory UCI commands** plus additional configurati
 * `go` - start search (supports time controls, depth, movetime, perft, infinite)
 * `stop` - halt search
 * `quit` - terminate engine
-* `setoption` - configure engine parameters (Hash, Ponder, OwnBook, Move Overhead, Minimum Thinking Time, Contempt, CatchAll)
+* `setoption` - configure engine parameters (Hash, Threads, Ponder, OwnBook, Move Overhead, Minimum Thinking Time, Contempt, CatchAll)
+
+---
+
+# Playing Strength
+
+Rating is measured via a gauntlet against Stockfish at limited strength levels (2100 / 2300 / 2500) using `cutechess-cli`, rated with `Ordo`.
 
 ---
 
@@ -173,6 +183,7 @@ The engine implements all **mandatory UCI commands** plus additional configurati
 * **Separate pawn hash table** for cached pawn structure evaluation
 * **Static exchange evaluation (SEE)** for accurate capture analysis
 * **Layered pruning techniques** to reduce explored nodes
+* **Lazy SMP multithreading** with a lock-free shared transposition table
 * **Opening book** with 3500+ positions from major opening lines
 * **Runtime-switchable theme system** with behavioral polymorphism for theme-specific UX
 * **Modular architecture** separating engine logic from interface layers
@@ -194,6 +205,16 @@ The project includes separate executables for GUI and UCI interfaces.
 
 **UCI**: Requires only standard C++ (no external dependencies).
 
+The repo ships a `Makefile` (MinGW/Windows) that builds both executables, with separate dev and release configurations.
+
+* `make` / `make dev` - builds both executables as unoptimized dev builds (dynamic SFML) in the project root
+* `make release` - builds both executables as optimized, statically-linked release builds in `dist/`, with assets copied alongside
+* `make gui` / `make uci` - build a single executable (dev)
+* `make release-gui` / `make release-uci` - build a single executable (release)
+* `make clean` - removes `build/` and `dist/`
+
+Set `SFML_INCLUDE` and `SFML_LIB` at the top of the Makefile to point at your local SFML install.
+
 ---
 
 # Testing
@@ -209,54 +230,13 @@ The engine includes a comprehensive test suite (`tests.cpp`) covering:
 
 Run tests to verify correctness after modifications.
 
----
+## Benchmarking
 
-# Assets
+A standalone benchmark script (`benchmark.py`) plays two engine builds against each other to measure relative strength.
 
-The GUI requires graphical and audio assets in a `Resources/` directory next to the executable.
+* concurrent game workers with a live TUI (board view, per-worker status, progress)
+* live Elo estimate with confidence interval, updated as games complete
+* randomized opening plies for game variety, with colors swapped each pair
+* statistical significance check to confirm whether one build is actually stronger, not just luckier
 
-Expected structure:
-
-```
-Resources/
-├── Textures/
-│   ├── Pieces.png
-│   └── Icons.png
-├── Fonts/
-│   └── Font.ttf
-└── Sounds/
-    ├── Capture.wav
-    ├── Check.wav
-    ├── Game End.wav
-    ├── Move Opp.wav
-    ├── Move Self.wav
-    ├── Notify.wav
-    ├── Promotion.wav
-    ├── Illegal.wav
-    └── Special Move.wav
-```
-
-## Piece Texture
-
-Chess pieces as a **texture atlas**:
-
-```
-[ WP | WB | WN | WR | WQ | WK ]
-[ BP | BB | BN | BR | BQ | BK ]
-```
-
-## Icons
-
-Icons in a **horizontal sprite sheet**:
-
-```
-[Flip | Engine | Cancel | Reset | Up | Down | Own Book On | Own Book Off | Ponder On | Ponder Off | CatchAll On | CatchAll Off | Inspection On | Inspection Off]
-```
-
-## Fonts
-
-Any TrueType font (`.ttf`).
-
-## Sounds
-
-Audio files for game events (in `.wav` format).
+Used to verify that engine changes are genuine improvements before merging them.
