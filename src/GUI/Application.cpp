@@ -10,7 +10,7 @@ Application::Application() {
 
     m_Board.SetHashSize(128);
     m_Board.SetCatchAll(false);
-    m_Board.SetThreads(4);
+    m_Board.SetThreads(2);
 
     loadFen(Chess::DefaultFEN);
 }

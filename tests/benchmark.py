@@ -389,7 +389,7 @@ def run_worker(worker_id: int, work_q: "queue.Queue", stats: MatchStats, dashboa
 
 
 def main() -> None:
-    concurrency = CONCURRENCY or os.cpu_count() or 1
+    concurrency = CONCURRENCY or max(1, (os.cpu_count() or 0) - 2)
 
     stats = MatchStats()
     total_games = GAME_PAIRS * 2
