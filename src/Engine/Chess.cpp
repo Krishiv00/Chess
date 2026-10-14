@@ -3129,6 +3129,8 @@ float Board::GetConfidence(PieceColor sideToMove, int thinkTimeMS) const {
     SearchContext::BeginNew(m_Hash);
     SearchContext::RootSide = sideToMove;
 
+    SearchContext::Data().PositionHistory[1] = m_Hash;
+
     // cancel search after time limit expires
     std::thread timerThread([thinkTimeMS]() {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(thinkTimeMS);
@@ -3291,10 +3293,6 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
 
     SearchContext::CountNode(ply);
 
-    if (depth <= 0) {
-        return quiescence(alpha, beta, sideToMove, ply + 1);
-    }
-
     // draw by game design
     if (
         FiftyMoveRule() ||
@@ -3310,12 +3308,22 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
         return engineToMove ? drawForEngine : -drawForEngine;
     }
 
+    if (depth <= 0) {
+        return quiescence(alpha, beta, sideToMove, ply + 1);
+    }
+
+    if (ply >= SearchContext::MaxPly - 2) {
+        return evaluate(sideToMove);
+    }
+
     Move ttMove;
 
     {
         int ttScore;
 
-        if (GameContext::TT.Probe(m_Hash, depth, alpha, beta, ttScore, ttMove)) {
+        const bool ttCutoffAllowed = !(ply <= 6 && m_HalfMoveClock >= 2);
+
+        if (GameContext::TT.Probe(m_Hash, depth, alpha, beta, ttScore, ttMove) && ttCutoffAllowed) {
             if (ttScore > MateThreshold)  return ttScore - ply;
             if (ttScore < -MateThreshold) return ttScore + ply;
             else return ttScore;
@@ -3342,6 +3350,8 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
 
         copy.m_EnPassantSquare = NullPos;
         copy.m_Hash = ZobristHasher::HashSideToMove(copy.m_Hash);
+
+        SearchContext::Data().PositionHistory[ply + 1] = copy.m_Hash;
 
         const int reduction = 2 + depth / 4;
         const int score = -copy.negamax(
@@ -3376,6 +3386,8 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
 
             Board copy = *this;
             copy.doMoveInternal(move);
+
+            SearchContext::Data().PositionHistory[ply + 1] = copy.m_Hash;
 
             const int score = -copy.negamax(
                 depth - 4, -probcutBeta, -probcutBeta + 1, InvertColor(sideToMove), ply + 1, ext

@@ -41,15 +41,17 @@ namespace Chess {
         None
     };
 
-    enum class PieceColor : uint8_t {
+    enum class PieceColor : bool {
         White, Black
     };
 
     namespace CastlingRights {
-        constexpr inline const uint8_t WhiteKingSideBit = 0b0001;
-        constexpr inline const uint8_t WhiteQueenSideBit = 0b0010;
-        constexpr inline const uint8_t BlackKingSideBit = 0b0100;
-        constexpr inline const uint8_t BlackQueenSideBit = 0b1000;
+        enum : uint8_t {
+            WhiteKingSideBit = 1 << 0,
+            WhiteQueenSideBit = 1 << 1,
+            BlackKingSideBit = 1 << 2,
+            BlackQueenSideBit = 1 << 3,
+        };
     }
 
     constexpr inline const MoveFlag PromotionFlags[] = {
@@ -81,8 +83,7 @@ namespace Chess {
     struct Move {
         Move() = default;
         Move(uint8_t start, uint8_t target) : StartingSquare(start), TargetSquare(target) {}
-        Move(uint8_t start, uint8_t target, MoveFlag flag)
-            : StartingSquare(start), TargetSquare(target), Flag(flag) {}
+        Move(uint8_t start, uint8_t target, MoveFlag flag) : StartingSquare(start), TargetSquare(target), Flag(flag) {}
 
         uint8_t StartingSquare{NullPos};
         uint8_t TargetSquare{NullPos};
