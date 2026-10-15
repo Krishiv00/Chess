@@ -18,7 +18,7 @@ namespace Chess {
 
     constexpr inline const char* DefaultFEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
-    enum class MoveFlag : uint16_t {
+    enum class MoveFlag : uint8_t {
         None = 0,
 
         EnPassant = 1 << 0,
@@ -26,13 +26,13 @@ namespace Chess {
         Capture = 1 << 2,
         Check = 1 << 3,
 
-        CastleKingSide = 1 << 4,
-        CastleQueenSide = 1 << 5,
+        PromoteToKnight = 1 << 4,
+        PromoteToBishop = 2 << 4,
+        PromoteToRook = 3 << 4,
+        PromoteToQueen = 4 << 4,
 
-        PromoteToKnight = 1 << 6,
-        PromoteToBishop = 1 << 7,
-        PromoteToRook = 1 << 8,
-        PromoteToQueen = 1 << 9,
+        CastleKingSide = 5 << 4,
+        CastleQueenSide = 6 << 4,
     };
 
     enum class PieceType : uint8_t {
@@ -76,8 +76,8 @@ namespace Chess {
         Piece() = default;
         Piece(PieceType type, PieceColor color) : Type(type), Color(color) {}
 
-        PieceType Type;
-        PieceColor Color;
+        PieceType Type : 3;
+        PieceColor Color : 1;
     };
 
     struct Move {
@@ -149,34 +149,41 @@ namespace Chess {
 
     [[nodiscard]]
     constexpr inline bool HasFlag(MoveFlag value, MoveFlag flag) noexcept {
-        return static_cast<uint16_t>(value) & static_cast<uint16_t>(flag);
+        constexpr uint8_t GroupMask = 0b1110000;
+        const uint8_t f = static_cast<uint8_t>(flag);
+
+        if (f & GroupMask) {
+            return (static_cast<uint8_t>(value) & GroupMask) == f;
+        }
+
+        return static_cast<uint8_t>(value) & f;
     }
 
     [[nodiscard]]
     constexpr inline MoveFlag AddFlag(MoveFlag base, MoveFlag flag) noexcept {
-        return static_cast<MoveFlag>(static_cast<uint16_t>(base) | static_cast<uint16_t>(flag));
+        return static_cast<MoveFlag>(static_cast<uint8_t>(base) | static_cast<uint8_t>(flag));
     }
 
     [[nodiscard]]
     constexpr inline bool isPromotion(MoveFlag flag) noexcept {
-        constexpr uint16_t Mask = (
-            static_cast<uint16_t>(MoveFlag::PromoteToKnight) |
-            static_cast<uint16_t>(MoveFlag::PromoteToBishop) |
-            static_cast<uint16_t>(MoveFlag::PromoteToRook) |
-            static_cast<uint16_t>(MoveFlag::PromoteToQueen)
-        );
+        constexpr uint8_t GroupMask = 0b1110000;
+        const uint8_t group = static_cast<uint8_t>(flag) & GroupMask;
 
-        return static_cast<uint16_t>(flag) & Mask;
+        return (
+            group >= static_cast<uint8_t>(MoveFlag::PromoteToKnight) &&
+            group <= static_cast<uint8_t>(MoveFlag::PromoteToQueen)
+        );
     }
 
     [[nodiscard]]
     constexpr inline bool isCastle(MoveFlag flag) noexcept {
-        constexpr uint16_t Mask = (
-            static_cast<uint16_t>(MoveFlag::CastleKingSide) |
-            static_cast<uint16_t>(MoveFlag::CastleQueenSide)
-        );
+        constexpr uint8_t GroupMask = 0b111'0000;
+        const uint8_t group = static_cast<uint8_t>(flag) & GroupMask;
 
-        return static_cast<uint16_t>(flag) & Mask;
+        return (
+            group == static_cast<uint8_t>(MoveFlag::CastleKingSide) ||
+            group == static_cast<uint8_t>(MoveFlag::CastleQueenSide)
+        );
     }
 
     [[nodiscard]]
