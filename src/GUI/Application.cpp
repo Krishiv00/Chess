@@ -36,6 +36,8 @@ void Application::loadFen(const std::string& fen) {
     m_GameOverTimer = 0.f;
     m_GameOverResult = GameOverResult::None;
     m_ParticleSystem.RemoveAll();
+
+    m_IllegalMoveTimer = 0.f;
 }
 
 Application::~Application() {
@@ -261,6 +263,8 @@ void Application::SetTargetSize(sf::Vector2u size) {
                 m_CurrentThemeIdx = (m_CurrentThemeIdx + 1) % Themes::Count;
                 m_Theme = Themes::Factories[m_CurrentThemeIdx]();
                 m_Popup = Popup("Theme: " + std::string(Themes::Names[m_CurrentThemeIdx]));
+
+                m_IllegalMoveTimer = 0.f;
             } else {
                 m_PromotionSelectionActive = false;
                 loadFen(Chess::DefaultFEN);
@@ -654,13 +658,11 @@ void Application::onMouseButtonSignal(sf::Vector2i position, bool released) {
     const auto [rank, file] = mapMousePosToCoordinates(position);
     const uint8_t idx = Chess::To2DIndex(rank, file);
 
-    if (released) {
-        if (hasSelectedPiece() && idx != m_SelectedPiece) dropPiece(idx);
-    } else {
-        const bool clickedOwnPiece = (m_Board.GetOccupancyMap(m_SideToMove) & Chess::IndexToMask(idx)) != 0ull;
+    if (hasSelectedPiece() && idx != m_SelectedPiece) {
+        dropPiece(idx, !released, released);
+    }
 
-        if (hasSelectedPiece()) dropPiece(idx, true, !clickedOwnPiece);
-
+    if (!released) {
         pickPiece(idx);
     }
 }
@@ -676,6 +678,8 @@ void Application::pickPiece(int idx) {
 }
 
 void Application::dropPiece(int idx, bool animate, bool playIllegalSfx) {
+    m_IllegalMoveTimer = 0.f;
+
     const auto it = std::find(m_LegalMovesForSelectedPiece.begin(), m_LegalMovesForSelectedPiece.end(),
         Chess::Move(m_SelectedPiece, idx)
     );
@@ -692,6 +696,11 @@ void Application::dropPiece(int idx, bool animate, bool playIllegalSfx) {
         if (!m_GameOver && !m_InspectionMode) pollEngineMove();
     } else if (idx != m_SelectedPiece && playIllegalSfx) {
         m_SfxPlayer.Play(Sfx::Illegal);
+
+        if (m_Theme->DrawIllegalMoveHighlight()) {
+            m_IllegalMoveTimer = 1.5f;
+            m_IllegallyMovedPiece = m_SelectedPiece;
+        }
     }
 
     m_SelectedPiece = Chess::NullPos;
@@ -759,6 +768,10 @@ void Application::Update(float deltaTime) {
 
     if (m_GameOverTimer > 0.f) {
         m_GameOverTimer += deltaTime;
+    }
+
+    if (m_IllegalMoveTimer) {
+        m_IllegalMoveTimer = std::max(0.f, m_IllegalMoveTimer - deltaTime);
     }
 
     m_ParticleSystem.Update(deltaTime);
@@ -1289,6 +1302,17 @@ void Application::Render(sf::RenderTarget& target, sf::Vector2i mousePosition) c
                 sf::Vector2f(
                     mapFile(Chess::ToFile(idx)) * m_SquareSize + m_EvaluationBarWidth,
                     mapRank(Chess::ToRank(idx)) * m_SquareSize
+                ),
+                m_SquareSize
+            );
+        }
+
+        if (m_IllegalMoveTimer && int(m_IllegalMoveTimer / 0.25f) % 2) {
+            m_Theme->RenderMarker(
+                target,
+                sf::Vector2f(
+                    mapFile(Chess::ToFile(m_IllegallyMovedPiece)) * m_SquareSize + m_EvaluationBarWidth,
+                    mapRank(Chess::ToRank(m_IllegallyMovedPiece)) * m_SquareSize
                 ),
                 m_SquareSize
             );

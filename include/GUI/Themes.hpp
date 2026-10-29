@@ -49,6 +49,9 @@ namespace Themes {
         virtual bool DrawHoveredSqOutline() const noexcept = 0;
 
         [[nodiscard]]
+        virtual bool DrawIllegalMoveHighlight() const noexcept = 0;
+
+        [[nodiscard]]
         inline const std::array<sf::Color, 2>& GetCheckerboard() const noexcept {
             return m_Checkerboard;
         }
@@ -147,6 +150,11 @@ namespace Themes {
 
         [[nodiscard]]
         virtual bool DrawHoveredSqOutline() const noexcept override {
+            return true;
+        }
+
+        [[nodiscard]]
+        virtual bool DrawIllegalMoveHighlight() const noexcept override {
             return true;
         }
     };
@@ -266,6 +274,11 @@ namespace Themes {
         virtual bool DrawHoveredSqOutline() const noexcept override {
             return false;
         }
+
+        [[nodiscard]]
+        virtual bool DrawIllegalMoveHighlight() const noexcept override {
+            return false;
+        }
     };
 
     class LichessBlue final : public Lichess {
@@ -339,6 +352,6 @@ namespace Themes {
     };
 
     constexpr inline const std::size_t Count = sizeof(Factories) / sizeof(Factories[0]);
-    
+
     static_assert(Count == sizeof(Names) / sizeof(Names[0]), "Theme count mismatch!");
 }

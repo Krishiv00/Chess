@@ -110,6 +110,9 @@ private:
     GameOverResult m_GameOverResult{GameOverResult::None};
     ParticleSystem m_ParticleSystem;
 
+    float m_IllegalMoveTimer{0.f};
+    uint8_t m_IllegallyMovedPiece;
+
     GameState m_InspectionEntryState;
 
     sf::Vector2i m_LastMousePosition;
