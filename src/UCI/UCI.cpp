@@ -59,7 +59,7 @@ void UciHandler::command_uci() const {
 
     std::cout
         // Bio
-        << "id name Chess++" << std::endl
+        << "id name " << Chess::EngineName << std::endl
         << "id author Krishiv" << std::endl
         // Expose options
         << "option name Move Overhead type spin default " << Options::MoveOverhead << " min 0 max 500" << std::endl

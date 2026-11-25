@@ -7,10 +7,58 @@
 #include <unordered_set>
 #include <array>
 #include <memory>
+#include <functional>
+#include <cstddef>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 #include "Engine/Chess.hpp"
 
 using namespace Chess;
+
+#pragma region Low Level Helpers
+
+[[nodiscard]]
+static inline std::size_t FastRange(uint64_t key, std::size_t n) noexcept {
+#if defined(__SIZEOF_INT128__)
+    return static_cast<std::size_t>((static_cast<unsigned __int128>(key) * n) >> 64);
+#elif defined(_MSC_VER) && defined(_M_X64)
+    return static_cast<std::size_t>(__umulh(key, static_cast<uint64_t>(n)));
+#else
+    return static_cast<std::size_t>(key % n);
+#endif
+}
+
+static inline void PrefetchAddress(const void* p) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(p);
+#elif defined(_MSC_VER)
+    _mm_prefetch(static_cast<const char*>(p), _MM_HINT_T0);
+#else
+    (void)p;
+#endif
+}
+
+template <typename T, std::size_t N>
+class UninitArray {
+public:
+    UninitArray() noexcept {}
+
+    [[nodiscard]] inline T* data() noexcept {
+        return reinterpret_cast<T*>(m_Storage);
+    }
+    [[nodiscard]] inline T& operator[](std::size_t i) noexcept {
+        return data()[i];
+    }
+    [[nodiscard]] inline operator T* () noexcept {
+        return data();
+    }
+
+private:
+    alignas(T) unsigned char m_Storage[sizeof(T) * N];
+};
 
 #pragma region Utils
 
@@ -212,7 +260,7 @@ public:
 
 private:
 
-    struct Slot {
+    struct alignas(16) Slot {
         std::atomic<uint64_t> Check{0};
         std::atomic<uint64_t> Data{0};
     };
@@ -257,10 +305,15 @@ public:
     }
 
 
+    inline void Prefetch(uint64_t key) const noexcept {
+        if (!m_Count) return;
+        PrefetchAddress(&m_Slots[FastRange(key, m_Count)]);
+    }
+
     bool Peek(uint64_t key, TTEntry& out) const noexcept {
         if (!m_Count) return false;
 
-        const Slot& slot = m_Slots[key % m_Count];
+        const Slot& slot = m_Slots[FastRange(key, m_Count)];
         const uint64_t data = slot.Data.load(std::memory_order_relaxed);
         const uint64_t check = slot.Check.load(std::memory_order_relaxed);
 
@@ -302,7 +355,7 @@ public:
     void Store(uint64_t key, int depth, int score, TTFlag flag, Move bestMove) {
         if (!m_Count) return;
 
-        Slot& slot = m_Slots[key % m_Count];
+        Slot& slot = m_Slots[FastRange(key, m_Count)];
         const TTEntry existing = Unpack(slot.Data.load(std::memory_order_relaxed));
 
         // replace if the slot is from an older search, or if the new result is at least as deep
@@ -351,13 +404,13 @@ public:
 
     const PawnTTEntry* Probe(uint64_t key) const noexcept {
         if (m_Entries.empty()) return nullptr;
-        const PawnTTEntry& e = m_Entries[key % m_Entries.size()];
+        const PawnTTEntry& e = m_Entries[FastRange(key, m_Entries.size())];
         return (e.Key == key) ? &e : nullptr;
     }
 
     void Store(uint64_t key, const PawnTTEntry& entry) noexcept {
         if (m_Entries.empty()) return;
-        PawnTTEntry& slot = m_Entries[key % m_Entries.size()];
+        PawnTTEntry& slot = m_Entries[FastRange(key, m_Entries.size())];
         slot = entry;
         slot.Key = key;
     }
@@ -681,14 +734,34 @@ struct GameContext {
 
 namespace SearchLimits {
     constexpr inline int MaxPly = 256;
+    constexpr inline int NoEval = 1 << 30;
+    constexpr inline int ContKeys = 12 * Ranks * Files;
 }
 
 struct SearchThreadData {
-    int32_t HistoryTable[Ranks * Files * Ranks * Files]{};
+    int32_t HistoryTable[2 * Ranks * Files * Ranks * Files]{};
     uint64_t PositionHistory[SearchLimits::MaxPly]{};
     Move killerMoves[SearchLimits::MaxPly][2];
     Move ExcludedMove[SearchLimits::MaxPly];
     PawnTranspositionTable PawnTT;
+
+    // used to tell whether the position is "improving" compared to two plies ago
+    int StaticEval[SearchLimits::MaxPly];
+    int ContKey[SearchLimits::MaxPly];
+    // the node at this ply was reached by a null move, so it must not null move again
+    bool SkipNull[SearchLimits::MaxPly];
+
+    SearchThreadData() {
+        for (int i = 0; i < SearchLimits::MaxPly; ++i) {
+            StaticEval[i] = SearchLimits::NoEval;
+            ContKey[i] = -1;
+            SkipNull[i] = false;
+        }
+    }
+
+    std::unique_ptr<int16_t[]> ContHist = std::make_unique<int16_t[]>(
+        static_cast<std::size_t>(SearchLimits::ContKeys) * SearchLimits::ContKeys
+    );
 };
 
 struct SearchContext {
@@ -715,9 +788,21 @@ struct SearchContext {
 
         for (auto& h : d.HistoryTable) h /= 2;
 
+        {
+            int16_t* ch = d.ContHist.get();
+            const std::size_t n = static_cast<std::size_t>(SearchLimits::ContKeys) * SearchLimits::ContKeys;
+            for (std::size_t i = 0; i < n; ++i) ch[i] = static_cast<int16_t>(ch[i] / 2);
+        }
+
         std::memset(d.killerMoves, 0, sizeof(d.killerMoves));
         std::memset(d.PositionHistory, 0, sizeof(d.PositionHistory));
         std::memset(d.ExcludedMove, 0, sizeof(d.ExcludedMove));
+
+        for (int i = 0; i < SearchLimits::MaxPly; ++i) {
+            d.StaticEval[i] = SearchLimits::NoEval;
+            d.ContKey[i] = -1;
+            d.SkipNull[i] = false;
+        }
 
         d.PositionHistory[0] = currentHash;
 
@@ -729,9 +814,27 @@ struct SearchContext {
 
     static inline std::atomic<bool> Cancelled;
 
-    static inline void UpdateHistory(int from, int to, int bonus) noexcept {
-        int32_t& h = Data().HistoryTable[from * (Ranks * Files) + to];
+    [[nodiscard]]
+    static constexpr inline int HistoryIndex(PieceColor color, int from, int to) noexcept {
+        return (static_cast<int>(color) * (Ranks * Files) + from) * (Ranks * Files) + to;
+    }
+
+    static inline void UpdateHistory(PieceColor color, int from, int to, int bonus) noexcept {
+        int32_t& h = Data().HistoryTable[HistoryIndex(color, from, to)];
         h += bonus - h * std::abs(bonus) / MaxHistory;
+    }
+
+    static inline void UpdateContHistory(int prevKey, int key, int bonus) noexcept {
+        if (prevKey < 0) return;
+
+        int16_t& h = Data().ContHist[static_cast<std::size_t>(prevKey) * SearchLimits::ContKeys + key];
+        h = static_cast<int16_t>(h + bonus - h * std::abs(bonus) / MaxHistory);
+    }
+
+    [[nodiscard]]
+    static inline int ContHistoryScore(int prevKey, int key) noexcept {
+        if (prevKey < 0) return 0;
+        return Data().ContHist[static_cast<std::size_t>(prevKey) * SearchLimits::ContKeys + key];
     }
 
     static inline bool CatchAllMode{false};
@@ -1031,6 +1134,7 @@ void Chess::Init() {
     LUTs::Init();
 
     GameContext::TT.SetSize(128);
+    SearchContext::MainData.PawnTT.SetSize(2);
 }
 
 void Chess::Board::NewGame() {
@@ -1038,6 +1142,244 @@ void Chess::Board::NewGame() {
     SearchContext::MainData.PawnTT.Clear();
 
     std::memset(SearchContext::Data().HistoryTable, 0, sizeof(SearchContext::Data().HistoryTable));
+    std::memset(
+        SearchContext::Data().ContHist.get(), 0,
+        sizeof(int16_t) * static_cast<std::size_t>(SearchLimits::ContKeys) * SearchLimits::ContKeys
+    );
+}
+
+#pragma region PST
+
+namespace PieceSquareTables {
+    static constexpr inline const int8_t TableRaw[][Ranks * Files] = {
+        // pawn earlygame
+        {
+            -46, -46, -46, -46, -46, -46, -46, -46,
+            36, 75, 37, 100, 68, 81, -38, -80,
+            -72, -42, -6, 2, 12, 32, 16, -42,
+            -84, -52, -47, -43, -15, -27, -11, -47,
+            -100, -60, -65, -40, -37, -51, -22, -68,
+            -100, -65, -64, -68, -43, -58, -6, -51,
+            -98, -60, -69, -81, -53, -27, 22, -49,
+            -46, -46, -46, -46, -46, -46, -46, -46
+        },
+
+        // bishop earlygame
+        {
+            -21, -54, -61, -100, -96, -67, 21, -51,
+            -14, 32, 0, -14, 14, 75, 18, 25,
+            1, 38, 61, 70, 68, 100, 87, 28,
+            -16, 4, 41, 64, 50, 46, 1, -1,
+            -21, -3, 8, 36, 38, 5, 8, -20,
+            -4, 9, 5, 9, 9, 8, 3, 18,
+            0, 3, 16, -14, -3, 21, 38, 4,
+            -39, -8, -25, -32, -30, -36, -12, -14
+        },
+
+        // knight earlygame
+        {
+            100, -100, -40, -53, 11, -91, -85, -80,
+            -47, -18, 27, 14, 29, 66, -4, 2,
+            -11, 18, 22, 41, 69, 100, 35, 27,
+            -23, -13, 7, 29, 7, 33, -9, 7,
+            -35, -20, -10, -11, -1, -4, 0, -28,
+            -50, -33, -19, -18, -7, -18, -15, -40,
+            -55, -53, -36, -27, -27, -24, -30, -31,
+            -97, -47, -65, -51, -49, -36, -49, -75
+        },
+
+        // rook earlygame
+        {
+            25, 29, 39, 44, 68, 87, 98, 100,
+            -23, -31, -6, 15, -3, 27, 28, 75,
+            -44, -27, -25, -11, 10, 17, 72, 13,
+            -68, -55, -47, -29, -28, -26, -23, -30,
+            -91, -86, -75, -58, -54, -69, -51, -75,
+            -99, -82, -76, -71, -63, -65, -34, -62,
+            -100, -83, -69, -66, -61, -56, -40, -93,
+            -83, -78, -68, -47, -50, -58, -67, -100
+        },
+
+        // queen earlygame
+        {
+            -63, -21, 27, 55, 64, 100, 87, 25,
+            -50, -76, -68, -81, -78, 14, -28, 82,
+            -47, -50, -42, -29, -12, 25, 50, 17,
+            -64, -63, -60, -57, -51, -37, -34, -28,
+            -69, -63, -67, -59, -57, -54, -46, -41,
+            -68, -55, -64, -61, -59, -56, -36, -44,
+            -69, -61, -48, -41, -48, -31, -20, -3,
+            -74, -86, -70, -54, -67, -81, -86, -100
+        },
+
+        // king earlygame
+        {
+            -50, -75, -75, -100, -100, -75, -75, -50,
+            -50, -75, -75, -100, -100, -75, -75, -50,
+            -50, -75, -75, -100, -100, -75, -75, -50,
+            -50, -75, -75, -100, -100, -75, -75, -50,
+            -25, -50, -50, -75, -75, -50, -50, -25,
+            0, -25, -25, -25, -25, -25, -25, 0,
+            75, 75, 25, 25, 25, 25, 75, 75,
+            75, 100, 50, 25, 25, 50, 100, 75
+        },
+
+        // pawn endgame
+        {
+            -90, -90, -90, -90, -90, -90, -90, -90,
+            94, 85, 81, 27, 20, 36, 94, 100,
+            30, 32, 0, -24, -36, -46, -1, 0,
+            -44, -57, -77, -90, -99, -94, -76, -71,
+            -68, -73, -91, -97, -100, -96, -85, -88,
+            -75, -75, -93, -82, -89, -90, -82, -91,
+            -69, -69, -78, -72, -74, -80, -81, -91,
+            -90, -90, -90, -90, -90, -90, -90, -90
+        },
+
+        // bishop endgame
+        {
+            -29, 23, 13, 52, 45, 13, -23, -29,
+            -61, 3, 26, 32, 19, -26, 26, -58,
+            39, 3, 42, 13, 23, 35, -13, 19,
+            19, 87, 52, 97, 77, 55, 71, 13,
+            6, 58, 100, 68, 68, 81, 52, -19,
+            0, 39, 61, 61, 81, 61, 16, -19,
+            -16, -26, -13, 35, 52, 6, 13, -71,
+            -74, -10, -81, 13, 0, 10, -55, -100
+        },
+
+        // knight endgame
+        {
+            -56, 8, 28, 29, 19, 14, 24, -100,
+            18, 37, 35, 48, 32, 12, 24, -8,
+            25, 42, 74, 69, 41, 35, 29, 5,
+            42, 78, 88, 95, 95, 83, 70, 31,
+            46, 61, 93, 97, 100, 84, 62, 42,
+            23, 52, 66, 88, 86, 58, 46, 25,
+            10, 40, 50, 54, 52, 53, 35, 27,
+            3, -22, 29, 37, 33, 31, -16, -11
+        },
+
+        // rook endgame
+        {
+            8, 32, 64, 52, 20, -12, -36, -52,
+            20, 100, 92, 56, 60, 36, 8, -92,
+            40, 52, 52, 40, -8, -40, -80, -76,
+            56, 44, 76, 52, 0, -28, -40, -56,
+            36, 52, 64, 44, 36, 32, -20, -20,
+            16, 8, 8, 24, 16, -20, -96, -84,
+            -8, -4, 8, 20, -16, -32, -88, -44,
+            -36, 16, 44, 32, 8, -8, -24, -100
+        },
+
+        // queen endgame
+        {
+            17, 17, 28, 20, 9, 7, -10, 16,
+            -10, 33, 68, 89, 100, 64, 88, 11,
+            -1, 17, 51, 55, 78, 52, 1, 11,
+            5, 31, 47, 66, 84, 61, 54, 34,
+            3, 32, 38, 60, 56, 44, 35, 22,
+            -4, -6, 31, 22, 31, 31, 7, -6,
+            -9, -8, -20, -11, 0, -28, -57, -100,
+            -16, -18, -16, -27, -9, -9, -38, -50
+        },
+
+        // king endgame
+        {
+            -100, -78, -56, -33, -33, -56, -78, -100,
+            -56, -33, -11, 11, 11, -11, -33, -56,
+            -56, -11, 56, 78, 78, 56, -11, -56,
+            -56, -11, 78, 100, 100, 78, -11, -56,
+            -56, -11, 78, 100, 100, 78, -11, -56,
+            -56, -11, 56, 78, 78, 56, -11, -56,
+            -56, -56, 11, 11, 11, 11, -56, -56,
+            -100, -56, -56, -56, -56, -56, -56, -100
+        },
+    };
+
+    static constexpr auto BuildTable() {
+        std::array<std::array<int8_t, Ranks* Files>, 12> t{};
+
+        for (int i = 0; i < 12; ++i) {
+            for (int sq = 0; sq < Ranks * Files; ++sq) t[i][sq] = TableRaw[i][sq];
+        }
+
+        for (const int i : {1, 2, 4, 7, 8, 10, 9}) {
+            for (int r = 0; r < Ranks; ++r) {
+                for (int f = 0; f < Files / 2; ++f) {
+                    const int a = r * Files + f;
+                    const int b = r * Files + (Files - 1 - f);
+                    const int avg = (TableRaw[i][a] + TableRaw[i][b]) / 2;
+                    t[i][a] = static_cast<int8_t>(avg);
+                    t[i][b] = static_cast<int8_t>(avg);
+                }
+            }
+        }
+
+        return t;
+    }
+
+    static constexpr inline auto Table = BuildTable();
+
+    [[nodiscard]]
+    static constexpr inline int PstMg(int pieceTypeIdx, int sq, bool isBlack) noexcept {
+        return Table[pieceTypeIdx][isBlack ? Utils::Mirror(sq) : sq];
+    }
+
+    [[nodiscard]]
+    static constexpr inline int PstEg(int pieceTypeIdx, int sq, bool isBlack) noexcept {
+        return Table[pieceTypeIdx + 6][isBlack ? Utils::Mirror(sq) : sq];
+    }
+
+    [[nodiscard]]
+    static constexpr inline int GetPSTScore(int pieceTypeIdx, int sq, bool isBlack, float endgameWeight) noexcept {
+        if (isBlack) sq = Utils::Mirror(sq);
+
+        const int early = Table[pieceTypeIdx][sq];
+        const int end = Table[pieceTypeIdx + 6][sq];
+
+        return Utils::IntLerp(early, end, endgameWeight);
+    }
+}
+
+#pragma region Incremental State
+
+namespace IncrementalEval {
+    constexpr int PhaseWeight[6] = {0, 1, 1, 2, 4, 0};
+
+    static inline void Update(int& mg, int& eg, int& phase, PieceType type, bool black, int sq, int sign) noexcept {
+        if (type == PieceType::Pawn || type == PieceType::King) return;
+
+        const int t = static_cast<int>(type);
+        const int s = black ? -sign : sign;
+
+        mg += s * (PieceValues[t] + PieceSquareTables::PstMg(t, sq, black));
+        eg += s * (PieceEgValues[t] + PieceSquareTables::PstEg(t, sq, black));
+        phase += sign * PhaseWeight[t];
+    }
+}
+
+void Board::refreshDerivedState() {
+    m_ColorOcc[0] = 0ull;
+    m_ColorOcc[1] = 0ull;
+
+    for (int i = 0; i < 6; ++i) {
+        m_ColorOcc[0] |= m_PieceMask[i];
+        m_ColorOcc[1] |= m_PieceMask[i + 6];
+    }
+
+    m_IncMg = 0;
+    m_IncEg = 0;
+    m_Phase = 0;
+
+    for (int c = 0; c < 2; ++c) {
+        // bishop, knight, rook, queen
+        for (int t = 1; t <= 4; ++t) {
+            for (uint64_t mask = m_PieceMask[c * 6 + t]; mask; mask &= mask - 1) {
+                IncrementalEval::Update(m_IncMg, m_IncEg, m_Phase, static_cast<PieceType>(t), c == 1, MaskToIndex(mask), 1);
+            }
+        }
+    }
 }
 
 #pragma region Fen String
@@ -1132,6 +1474,8 @@ PieceColor Board::LoadFromFen(const std::string& fen) {
 
     // Parse full move count (number of times black has moved)
     GameContext::MoveCount = std::stoi(moveCountStr);
+
+    refreshDerivedState();
 
     m_Hash = ZobristHasher::GetHash(*this, sideToMove);
     m_PawnAndKingHash = ZobristHasher::GetPawnAndKingHash(*this);
@@ -1386,13 +1730,16 @@ bool Board::HasAnyLegalMoves(PieceColor sideToMove) const noexcept {
                     const int capturedSq = m_EnPassantSquare - pushDir;
                     const uint64_t epMask = IndexToMask(m_EnPassantSquare) | IndexToMask(capturedSq);
 
-                    // must either capture checker or block check
-                    if ((epMask & checkMask) == 0ull) continue;
+                    // must either capture checker or block check, and must respect a pin
+                    const bool epResolvesCheck = (epMask & checkMask) != 0ull;
+                    const bool epRespectsPin = !(pins.Pinned & IndexToMask(sq)) || (pins.Rays[sq] & IndexToMask(m_EnPassantSquare));
 
-                    const uint64_t occAfterEP = occ & ~IndexToMask(sq) & ~IndexToMask(capturedSq);
-                    const uint64_t enemyRQ = m_PieceMask[enmOff + 3] | m_PieceMask[enmOff + 4];
+                    if (epResolvesCheck && epRespectsPin) {
+                        const uint64_t occAfterEP = (occ & ~IndexToMask(sq) & ~IndexToMask(capturedSq)) | IndexToMask(m_EnPassantSquare);
+                        const uint64_t enemyRQ = m_PieceMask[enmOff + 3] | m_PieceMask[enmOff + 4];
 
-                    if (!(MagicBitboard::OrthogonalAttacks(kingSq, occAfterEP) & enemyRQ)) return true;
+                        if (!(MagicBitboard::OrthogonalAttacks(kingSq, occAfterEP) & enemyRQ)) return true;
+                    }
                 }
             }
 
@@ -1400,9 +1747,13 @@ bool Board::HasAnyLegalMoves(PieceColor sideToMove) const noexcept {
             if (!(occ & IndexToMask(sq + pushDir))) {
                 if (IndexToMask(sq + pushDir) & allowed) return true;
 
-                // double push
-                const uint64_t rawDouble = LUTs::PawnMoves[isBlack][sq] & IndexToMask(sq + pushDir + pushDir);
-                if (rawDouble && !(occ & rawDouble) && (rawDouble & allowed)) return true;
+                // double push, only from the home rank
+                const uint64_t homeRank = isBlack ? 0x000000000000FF00ull : 0x00FF000000000000ull;
+
+                if (IndexToMask(sq) & homeRank) {
+                    const uint64_t to2mask = IndexToMask(sq + pushDir + pushDir);
+                    if (!(occ & to2mask) && (to2mask & allowed)) return true;
+                }
             }
         }
     }
@@ -1448,6 +1799,9 @@ void Board::doMoveInternal(Move move) {
     const int srcColorOff = moverIsBlack ? 6 : 0;
     const int srcIdx = static_cast<int>(mover.Type) + srcColorOff;
 
+    const int myColor = moverIsBlack ? 1 : 0;
+    const int enemyColor = myColor ^ 1;
+
     const bool isCapture = HasFlag(move.Flag, MoveFlag::Capture);
 
     // XOR out old piece
@@ -1463,6 +1817,9 @@ void Board::doMoveInternal(Move move) {
         const int capIdx = Utils::PieceToBitIdx(captured.Type, captured.Color);
 
         m_PieceMask[capIdx] &= ~toMask;
+
+        m_ColorOcc[enemyColor] &= ~toMask;
+        IncrementalEval::Update(m_IncMg, m_IncEg, m_Phase, captured.Type, !moverIsBlack, move.TargetSquare, -1);
 
         m_Hash = ZobristHasher::HashPiece(m_Hash, captured, move.TargetSquare);
 
@@ -1528,6 +1885,9 @@ void Board::doMoveInternal(Move move) {
     // remove piece from starting square
     m_PieceMask[srcIdx] &= ~fromMask;
 
+    m_ColorOcc[myColor] = (m_ColorOcc[myColor] & ~fromMask) | toMask;
+    IncrementalEval::Update(m_IncMg, m_IncEg, m_Phase, mover.Type, moverIsBlack, move.StartingSquare, -1);
+
     // move pieces in mailbox
     m_Mailbox[move.TargetSquare].Color = mover.Color; // type is set below after promotions
     m_Mailbox[move.StartingSquare].Type = PieceType::None;
@@ -1563,6 +1923,10 @@ void Board::doMoveInternal(Move move) {
         m_PieceMask[rookIdx] &= ~IndexToMask(rookFrom);
         m_PieceMask[rookIdx] |= IndexToMask(rookTo);
 
+        m_ColorOcc[myColor] = (m_ColorOcc[myColor] & ~IndexToMask(rookFrom)) | IndexToMask(rookTo);
+        IncrementalEval::Update(m_IncMg, m_IncEg, m_Phase, PieceType::Rook, moverIsBlack, rookFrom, -1);
+        IncrementalEval::Update(m_IncMg, m_IncEg, m_Phase, PieceType::Rook, moverIsBlack, rookTo, 1);
+
         m_Mailbox[rookTo] = rook;
         m_Mailbox[rookFrom].Type = PieceType::None;
 
@@ -1586,6 +1950,7 @@ void Board::doMoveInternal(Move move) {
         m_PawnAndKingHash = ZobristHasher::HashPiece(m_PawnAndKingHash, enemyPawn, capturedPos);
 
         m_PieceMask[enemyPawnIdx] &= ~IndexToMask(capturedPos);
+        m_ColorOcc[enemyColor] &= ~IndexToMask(capturedPos);
         m_Mailbox[capturedPos].Type = PieceType::None;
     }
 
@@ -1599,6 +1964,8 @@ void Board::doMoveInternal(Move move) {
     // set piece at new position
     m_PieceMask[static_cast<int>(landingType) + srcColorOff] |= toMask;
     m_Mailbox[move.TargetSquare].Type = landingType;
+
+    IncrementalEval::Update(m_IncMg, m_IncEg, m_Phase, landingType, moverIsBlack, move.TargetSquare, 1);
 
     const Piece lander = Piece(landingType, mover.Color);
 
@@ -1955,19 +2322,22 @@ void Board::generateMoves(
                     const uint64_t epMask = IndexToMask(m_EnPassantSquare) | IndexToMask(capturedSq);
 
                     // must capture checker or block check
-                    if ((epMask & checkMask) == 0ull) continue;
+                    const bool epResolvesCheck = (epMask & checkMask) != 0ull;
 
                     // pin restriction only
-                    if ((pins.Pinned & sqMask) && !(pins.Rays[sq] & IndexToMask(m_EnPassantSquare))) continue;
+                    const bool epRespectsPin = !(pins.Pinned & sqMask) || (pins.Rays[sq] & IndexToMask(m_EnPassantSquare));
 
-                    const uint64_t occAfterEP = (occ & ~sqMask & ~IndexToMask(capturedSq)) | IndexToMask(m_EnPassantSquare);
-                    const uint64_t enemyRQ = m_PieceMask[enmOff + 3] | m_PieceMask[enmOff + 4];
+                    // a pinned pawn that can't resolve check via en-passant may still have a legal push below
+                    if (epResolvesCheck && epRespectsPin) {
+                        const uint64_t occAfterEP = (occ & ~sqMask & ~IndexToMask(capturedSq)) | IndexToMask(m_EnPassantSquare);
+                        const uint64_t enemyRQ = m_PieceMask[enmOff + 3] | m_PieceMask[enmOff + 4];
 
-                    const int kingSq = MaskToIndex(m_PieceMask[myOff + 5]);
+                        const int kingSq = MaskToIndex(m_PieceMask[myOff + 5]);
 
-                    // EP horizontal discovered check test
-                    if (!(MagicBitboard::OrthogonalAttacks(kingSq, occAfterEP) & enemyRQ)) {
-                        pushMove(Move(sq, m_EnPassantSquare, AddFlag(MoveFlag::EnPassant, MoveFlag::Capture)), isBlack, occ, cd, out, moveCount);
+                        // EP horizontal discovered check test
+                        if (!(MagicBitboard::OrthogonalAttacks(kingSq, occAfterEP) & enemyRQ)) {
+                            pushMove(Move(sq, m_EnPassantSquare, AddFlag(MoveFlag::EnPassant, MoveFlag::Capture)), isBlack, occ, cd, out, moveCount);
+                        }
                     }
                 }
             }
@@ -2044,18 +2414,25 @@ void Board::generateMoves(
 }
 
 void Board::getAllLegalMoves(PieceColor sideToMove, Move* out, unsigned int& moveCount) const {
+    getAllLegalMoves(sideToMove, getCheckMask(sideToMove, GetOccupancyMap()), out, moveCount);
+}
+
+void Board::getAllLegalMoves(PieceColor sideToMove, uint64_t checkMask, Move* out, unsigned int& moveCount) const {
     const uint64_t friendly = GetOccupancyMap(sideToMove);
     const uint64_t enemy = GetOccupancyMap(InvertColor(sideToMove));
     const uint64_t occ = friendly | enemy;
 
     const PinMasks pins = getPinMasks(sideToMove, friendly, occ);
-    const uint64_t checkMask = getCheckMask(sideToMove, occ);
     const uint64_t attacked = getAttackedSquares(InvertColor(sideToMove), occ);
 
     generateMoves(sideToMove, pins, checkMask, attacked, friendly, enemy, occ, -1, out, moveCount);
 }
 
 void Chess::Board::getAllCaptureMoves(PieceColor sideToMove, Move* out, unsigned int& moveCount) const {
+    getAllCaptureMoves(sideToMove, getCheckMask(sideToMove, GetOccupancyMap()), out, moveCount);
+}
+
+void Chess::Board::getAllCaptureMoves(PieceColor sideToMove, uint64_t checkMask, Move* out, unsigned int& moveCount) const {
     const bool isBlack = sideToMove == PieceColor::Black;
     const int myOff = isBlack ? 6 : 0;
     const int enmOff = myOff ^ 6;
@@ -2065,14 +2442,17 @@ void Chess::Board::getAllCaptureMoves(PieceColor sideToMove, Move* out, unsigned
     const uint64_t occ = friendly | enemy;
 
     const PinMasks pins = getPinMasks(sideToMove, friendly, occ);
-    const uint64_t checkMask = getCheckMask(sideToMove, occ);
-    const uint64_t attacked = getAttackedSquares(InvertColor(sideToMove), occ);
 
     /* king captures */ {
         const int kingSq = MaskToIndex(m_PieceMask[myOff + 5]);
 
-        for (uint64_t tmp = LUTs::KingAttacks[kingSq] & enemy & ~attacked; tmp; tmp &= tmp - 1) {
-            out[moveCount++] = Move(kingSq, MaskToIndex(tmp), MoveFlag::Capture);
+        // actually has something to capture
+        if (uint64_t kingCaptures = LUTs::KingAttacks[kingSq] & enemy) {
+            kingCaptures &= ~getAttackedSquares(InvertColor(sideToMove), occ);
+
+            for (; kingCaptures; kingCaptures &= kingCaptures - 1) {
+                out[moveCount++] = Move(kingSq, MaskToIndex(kingCaptures), MoveFlag::Capture);
+            }
         }
     }
 
@@ -2118,7 +2498,8 @@ void Chess::Board::getAllCaptureMoves(PieceColor sideToMove, Move* out, unsigned
                 if ((pins.Pinned & sqMask) && !(pins.Rays[sq] & IndexToMask(m_EnPassantSquare))) continue;
 
                 // horizontal discovered check test - two pawns leave the rank at once
-                const uint64_t occAfterEP = occ & ~sqMask & ~IndexToMask(capturedSq);
+                // (the capturing pawn lands on the en-passant square, which can block a ray as well)
+                const uint64_t occAfterEP = (occ & ~sqMask & ~IndexToMask(capturedSq)) | IndexToMask(m_EnPassantSquare);
                 const uint64_t enemyRQ = m_PieceMask[enmOff + 3] | m_PieceMask[enmOff + 4];
                 const int kingSq = MaskToIndex(m_PieceMask[myOff + 5]);
 
@@ -2186,35 +2567,22 @@ std::vector<Move> Board::GetLegalMoves(int idx) const {
     const uint64_t checkMask = getCheckMask(piece.Color, occ);
     const uint64_t attacked = getAttackedSquares(enemy, occ);
 
-    Move moves[MaxLegalMoves];
+    UninitArray<Move, MaxLegalMoves> moves;
     unsigned int numMoves = 0u;
 
     generateMoves(piece.Color, pins, checkMask, attacked, friendly, enemyOcc, occ, idx, moves, numMoves);
 
-    return std::vector<Move>(moves, moves + numMoves);
+    return std::vector<Move>(moves.data(), moves.data() + numMoves);
 }
 
 #pragma region Occupancy
 
 uint64_t Board::GetOccupancyMap(PieceColor color) const noexcept {
-    const int colOffset = static_cast<int>(color) * 6;
-
-    return (
-        m_PieceMask[colOffset] | m_PieceMask[colOffset + 1] |
-        m_PieceMask[colOffset + 2] | m_PieceMask[colOffset + 3] |
-        m_PieceMask[colOffset + 4] | m_PieceMask[colOffset + 5]
-    );
+    return m_ColorOcc[static_cast<int>(color)];
 }
 
 uint64_t Board::GetOccupancyMap() const noexcept {
-    return (
-        m_PieceMask[0] | m_PieceMask[1] |
-        m_PieceMask[2] | m_PieceMask[3] |
-        m_PieceMask[4] | m_PieceMask[5] |
-        m_PieceMask[6] | m_PieceMask[7] |
-        m_PieceMask[8] | m_PieceMask[9] |
-        m_PieceMask[10] | m_PieceMask[11]
-    );
+    return m_ColorOcc[0] | m_ColorOcc[1];
 }
 
 void Chess::Board::SetContempt(int contempt) const {
@@ -2243,201 +2611,6 @@ unsigned int Chess::Board::GetHashSize() const noexcept {
     return GameContext::TT.GetSize();
 }
 
-#pragma region PST
-
-namespace PieceSquareTables {
-    static constexpr inline const int8_t TableRaw[][Ranks * Files] = {
-        // pawn earlygame
-        {
-            -46, -46, -46, -46, -46, -46, -46, -46,
-            36, 75, 37, 100, 68, 81, -38, -80,
-            -72, -42, -6, 2, 12, 32, 16, -42,
-            -84, -52, -47, -43, -15, -27, -11, -47,
-            -100, -60, -65, -40, -37, -51, -22, -68,
-            -100, -65, -64, -68, -43, -58, -6, -51,
-            -98, -60, -69, -81, -53, -27, 22, -49,
-            -46, -46, -46, -46, -46, -46, -46, -46
-        },
-
-        // bishop earlygame
-        {
-            -21, -54, -61, -100, -96, -67, 21, -51,
-            -14, 32, 0, -14, 14, 75, 18, 25,
-            1, 38, 61, 70, 68, 100, 87, 28,
-            -16, 4, 41, 64, 50, 46, 1, -1,
-            -21, -3, 8, 36, 38, 5, 8, -20,
-            -4, 9, 5, 9, 9, 8, 3, 18,
-            0, 3, 16, -14, -3, 21, 38, 4,
-            -39, -8, -25, -32, -30, -36, -12, -14
-        },
-
-        // knight earlygame
-        {
-            100, -100, -40, -53, 11, -91, -85, -80,
-            -47, -18, 27, 14, 29, 66, -4, 2,
-            -11, 18, 22, 41, 69, 100, 35, 27,
-            -23, -13, 7, 29, 7, 33, -9, 7,
-            -35, -20, -10, -11, -1, -4, 0, -28,
-            -50, -33, -19, -18, -7, -18, -15, -40,
-            -55, -53, -36, -27, -27, -24, -30, -31,
-            -97, -47, -65, -51, -49, -36, -49, -75
-        },
-
-        // rook earlygame
-        {
-            25, 29, 39, 44, 68, 87, 98, 100,
-            -23, -31, -6, 15, -3, 27, 28, 75,
-            -44, -27, -25, -11, 10, 17, 72, 13,
-            -68, -55, -47, -29, -28, -26, -23, -30,
-            -91, -86, -75, -58, -54, -69, -51, -75,
-            -99, -82, -76, -71, -63, -65, -34, -62,
-            -100, -83, -69, -66, -61, -56, -40, -93,
-            -83, -78, -68, -47, -50, -58, -67, -100
-        },
-
-        // queen earlygame
-        {
-            -63, -21, 27, 55, 64, 100, 87, 25,
-            -50, -76, -68, -81, -78, 14, -28, 82,
-            -47, -50, -42, -29, -12, 25, 50, 17,
-            -64, -63, -60, -57, -51, -37, -34, -28,
-            -69, -63, -67, -59, -57, -54, -46, -41,
-            -68, -55, -64, -61, -59, -56, -36, -44,
-            -69, -61, -48, -41, -48, -31, -20, -3,
-            -74, -86, -70, -54, -67, -81, -86, -100
-        },
-
-        // king earlygame
-        {
-            -50, -75, -75, -100, -100, -75, -75, -50,
-            -50, -75, -75, -100, -100, -75, -75, -50,
-            -50, -75, -75, -100, -100, -75, -75, -50,
-            -50, -75, -75, -100, -100, -75, -75, -50,
-            -25, -50, -50, -75, -75, -50, -50, -25,
-            0, -25, -25, -25, -25, -25, -25, 0,
-            75, 75, 25, 25, 25, 25, 75, 75,
-            75, 100, 50, 25, 25, 50, 100, 75
-        },
-
-        // pawn endgame
-        {
-            -90, -90, -90, -90, -90, -90, -90, -90,
-            94, 85, 81, 27, 20, 36, 94, 100,
-            30, 32, 0, -24, -36, -46, -1, 0,
-            -44, -57, -77, -90, -99, -94, -76, -71,
-            -68, -73, -91, -97, -100, -96, -85, -88,
-            -75, -75, -93, -82, -89, -90, -82, -91,
-            -69, -69, -78, -72, -74, -80, -81, -91,
-            -90, -90, -90, -90, -90, -90, -90, -90
-        },
-
-        // bishop endgame
-        {
-            -29, 23, 13, 52, 45, 13, -23, -29,
-            -61, 3, 26, 32, 19, -26, 26, -58,
-            39, 3, 42, 13, 23, 35, -13, 19,
-            19, 87, 52, 97, 77, 55, 71, 13,
-            6, 58, 100, 68, 68, 81, 52, -19,
-            0, 39, 61, 61, 81, 61, 16, -19,
-            -16, -26, -13, 35, 52, 6, 13, -71,
-            -74, -10, -81, 13, 0, 10, -55, -100
-        },
-
-        // knight endgame
-        {
-            -56, 8, 28, 29, 19, 14, 24, -100,
-            18, 37, 35, 48, 32, 12, 24, -8,
-            25, 42, 74, 69, 41, 35, 29, 5,
-            42, 78, 88, 95, 95, 83, 70, 31,
-            46, 61, 93, 97, 100, 84, 62, 42,
-            23, 52, 66, 88, 86, 58, 46, 25,
-            10, 40, 50, 54, 52, 53, 35, 27,
-            3, -22, 29, 37, 33, 31, -16, -11
-        },
-
-        // rook endgame
-        {
-            8, 32, 64, 52, 20, -12, -36, -52,
-            20, 100, 92, 56, 60, 36, 8, -92,
-            40, 52, 52, 40, -8, -40, -80, -76,
-            56, 44, 76, 52, 0, -28, -40, -56,
-            36, 52, 64, 44, 36, 32, -20, -20,
-            16, 8, 8, 24, 16, -20, -96, -84,
-            -8, -4, 8, 20, -16, -32, -88, -44,
-            -36, 16, 44, 32, 8, -8, -24, -100
-        },
-
-        // queen endgame
-        {
-            17, 17, 28, 20, 9, 7, -10, 16,
-            -10, 33, 68, 89, 100, 64, 88, 11,
-            -1, 17, 51, 55, 78, 52, 1, 11,
-            5, 31, 47, 66, 84, 61, 54, 34,
-            3, 32, 38, 60, 56, 44, 35, 22,
-            -4, -6, 31, 22, 31, 31, 7, -6,
-            -9, -8, -20, -11, 0, -28, -57, -100,
-            -16, -18, -16, -27, -9, -9, -38, -50
-        },
-
-        // king endgame
-        {
-            -100, -78, -56, -33, -33, -56, -78, -100,
-            -56, -33, -11, 11, 11, -11, -33, -56,
-            -56, -11, 56, 78, 78, 56, -11, -56,
-            -56, -11, 78, 100, 100, 78, -11, -56,
-            -56, -11, 78, 100, 100, 78, -11, -56,
-            -56, -11, 56, 78, 78, 56, -11, -56,
-            -56, -56, 11, 11, 11, 11, -56, -56,
-            -100, -56, -56, -56, -56, -56, -56, -100
-        },
-    };
-
-    static constexpr auto BuildTable() {
-        std::array<std::array<int8_t, Ranks* Files>, 12> t{};
-
-        for (int i = 0; i < 12; ++i) {
-            for (int sq = 0; sq < Ranks * Files; ++sq) t[i][sq] = TableRaw[i][sq];
-        }
-
-        // indices: 1 bishop, 2 knight, 4 queen (early) +6 for the endgame tables, 9 = rook endgame
-        for (const int i : {1, 2, 4, 7, 8, 10, 9}) {
-            for (int r = 0; r < Ranks; ++r) {
-                for (int f = 0; f < Files / 2; ++f) {
-                    const int a = r * Files + f;
-                    const int b = r * Files + (Files - 1 - f);
-                    const int avg = (TableRaw[i][a] + TableRaw[i][b]) / 2;
-                    t[i][a] = static_cast<int8_t>(avg);
-                    t[i][b] = static_cast<int8_t>(avg);
-                }
-            }
-        }
-
-        return t;
-    }
-
-    static constexpr inline auto Table = BuildTable();
-
-    [[nodiscard]]
-    static constexpr inline int PstMg(int pieceTypeIdx, int sq, bool isBlack) noexcept {
-        return Table[pieceTypeIdx][isBlack ? Utils::Mirror(sq) : sq];
-    }
-
-    [[nodiscard]]
-    static constexpr inline int PstEg(int pieceTypeIdx, int sq, bool isBlack) noexcept {
-        return Table[pieceTypeIdx + 6][isBlack ? Utils::Mirror(sq) : sq];
-    }
-
-    [[nodiscard]]
-    static constexpr inline int GetPSTScore(int pieceTypeIdx, int sq, bool isBlack, float endgameWeight) noexcept {
-        if (isBlack) sq = Utils::Mirror(sq);
-
-        const int early = Table[pieceTypeIdx][sq];
-        const int end = Table[pieceTypeIdx + 6][sq];
-
-        return Utils::IntLerp(early, end, endgameWeight);
-    }
-}
-
 #pragma region Evaluation
 
 float Board::getEndgameWeight() const {
@@ -2450,13 +2623,11 @@ float Board::getEndgameWeight() const {
 
     constexpr int MaxPhase = 2 * QueenWeight + 4 * RookWeight + 8 * MinorWeight;
 
-    const int phase = (
-        NumBitsOn(m_PieceMask[4] | m_PieceMask[10]) * QueenWeight +
-        NumBitsOn(m_PieceMask[3] | m_PieceMask[9]) * RookWeight +
-        NumBitsOn(m_PieceMask[1] | m_PieceMask[7] | m_PieceMask[2] | m_PieceMask[8]) * MinorWeight
-    );
+    static_assert(IncrementalEval::PhaseWeight[4] == QueenWeight);
+    static_assert(IncrementalEval::PhaseWeight[3] == RookWeight);
+    static_assert(IncrementalEval::PhaseWeight[1] == MinorWeight && IncrementalEval::PhaseWeight[2] == MinorWeight);
 
-    return 1.f - std::clamp(static_cast<float>(phase) / MaxPhase, 0.f, 1.f);
+    return 1.f - std::clamp(static_cast<float>(m_Phase) / MaxPhase, 0.f, 1.f);
 }
 
 #pragma region Eval Helpers
@@ -2525,8 +2696,8 @@ namespace {
         const int off = c * 6;
         const int e = c ^ 1;
 
-        const uint64_t pawns = b.m_PieceMask[off];
-        const uint64_t enemyPawns = b.m_PieceMask[e * 6];
+        const uint64_t pawns = b.GetPieceMasks()[off];
+        const uint64_t enemyPawns = b.GetPieceMasks()[e * 6];
 
         Score s;
         int fileCounts[Files] = {};
@@ -2600,7 +2771,7 @@ namespace {
         }
 
         /* king: piece square table + pawn shield + open files in front of it */ {
-            const int kingSq = MaskToIndex(b.m_PieceMask[off + 5]);
+            const int kingSq = MaskToIndex(b.GetPieceMasks()[off + 5]);
 
             s += Score(PieceSquareTables::PstMg(5, kingSq, black), PieceSquareTables::PstEg(5, kingSq, black));
 
@@ -2638,7 +2809,7 @@ namespace {
 
         const bool black = c == 1;
         const int e = c ^ 1;
-        const uint64_t* pm = b.m_PieceMask;
+        const uint64_t* pm = b.GetPieceMasks();
 
         const int ownKing = MaskToIndex(pm[c * 6 + 5]);
         const int oppKing = MaskToIndex(pm[e * 6 + 5]);
@@ -2697,7 +2868,7 @@ namespace {
     };
 
     Score EvalPieces(const Board& b, uint64_t occW, uint64_t occB, uint64_t occ) noexcept {
-        const uint64_t* pm = b.m_PieceMask;
+        const uint64_t* pm = b.GetPieceMasks();
         const uint64_t colorOcc[2] = {occW, occB};
 
         AttackMaps am;
@@ -2748,11 +2919,6 @@ namespace {
                 const uint64_t atk = MagicBitboard::DiagonalAttacks(sq, occ);
                 am.byPiece[c][1] |= atk;
 
-                s += Score(
-                    PieceValues[1] + PieceSquareTables::PstMg(1, sq, black),
-                    PieceEgValues[1] + PieceSquareTables::PstEg(1, sq, black)
-                );
-
                 const int mob = LUTs::BishopMobilityScore[NumBitsOn(atk & area)];
                 s += Score(mob, mob);
 
@@ -2766,11 +2932,6 @@ namespace {
                 const int sq = MaskToIndex(tmp);
                 const uint64_t atk = LUTs::KnightAttacks[sq];
                 am.byPiece[c][2] |= atk;
-
-                s += Score(
-                    PieceValues[2] + PieceSquareTables::PstMg(2, sq, black),
-                    PieceEgValues[2] + PieceSquareTables::PstEg(2, sq, black)
-                );
 
                 const int mob = LUTs::KnightMobilityScore[NumBitsOn(atk & area)];
                 s += Score(mob, mob);
@@ -2798,11 +2959,6 @@ namespace {
                 const uint64_t atk = MagicBitboard::OrthogonalAttacks(sq, occ);
                 am.byPiece[c][3] |= atk;
 
-                s += Score(
-                    PieceValues[3] + PieceSquareTables::PstMg(3, sq, black),
-                    PieceEgValues[3] + PieceSquareTables::PstEg(3, sq, black)
-                );
-
                 const int mob = LUTs::RookMobilityScore[NumBitsOn(atk & area)];
                 s += Score(mob, mob);
 
@@ -2821,11 +2977,6 @@ namespace {
                 const int sq = MaskToIndex(tmp);
                 const uint64_t atk = MagicBitboard::CombinedAttacks(sq, occ);
                 am.byPiece[c][4] |= atk;
-
-                s += Score(
-                    PieceValues[4] + PieceSquareTables::PstMg(4, sq, black),
-                    PieceEgValues[4] + PieceSquareTables::PstEg(4, sq, black)
-                );
 
                 const int mob = LUTs::QueenMobilityScore[NumBitsOn(atk & area)];
                 s += Score(mob, mob);
@@ -2909,26 +3060,29 @@ namespace {
 
 #pragma region Evaluation
 
+static PawnTranspositionTable::PawnTTEntry GetPawnData(const Board& board) noexcept {
+    PawnTranspositionTable& pawnTT = SearchContext::Data().PawnTT;
+
+    if (const auto* cached = pawnTT.Probe(board.GetPawnAndKingHash())) {
+        return *cached;
+    }
+
+    const PawnTranspositionTable::PawnTTEntry entry = BuildPawnEntry(board);
+    pawnTT.Store(board.GetPawnAndKingHash(), entry);
+
+    return entry;
+}
+
 int Board::evaluate(PieceColor sideToMove, float endgameWeight) const noexcept {
     const uint64_t occW = GetOccupancyMap(PieceColor::White);
     const uint64_t occB = GetOccupancyMap(PieceColor::Black);
     const uint64_t occ = occW | occB;
 
-    // pawns + kings: cached. Nothing in the cached entry depends on other pieces or on the phase.
-    PawnTranspositionTable::PawnTTEntry pawnData;
-
-    PawnTranspositionTable& pawnTT = SearchContext::Data().PawnTT;
-
-    if (const auto* cached = pawnTT.Probe(m_PawnAndKingHash)) {
-        pawnData = *cached;
-    } else {
-        pawnData = BuildPawnEntry(*this);
-        pawnTT.Store(m_PawnAndKingHash, pawnData);
-    }
+    const PawnTranspositionTable::PawnTTEntry pawnData = GetPawnData(*this);
 
     const bool whiteToMove = sideToMove == PieceColor::White;
 
-    Score total(pawnData.Mg, pawnData.Eg);
+    Score total(pawnData.Mg + m_IncMg, pawnData.Eg + m_IncEg);
     total += EvalPieces(*this, occW, occB, occ);
     total += EvalPassers(*this, 0, pawnData.Passed[0], occ, !whiteToMove);
     total -= EvalPassers(*this, 1, pawnData.Passed[1], occ, whiteToMove);
@@ -3100,9 +3254,6 @@ int Board::see(Move move) const {
 
         if (!attacker) break;
 
-        // NOTE: must not be written as gain[++depth] = ... - gain[depth - 1]; in C++17 the right hand side
-        // is evaluated first so that would read gain[-1] on the first iteration
-        // a king may only capture last: give it a huge value so recapturing "into" a defended square never looks free
         gain[depth + 1] = (lastMoved == PieceType::King ? 20000 : PieceValues[static_cast<int>(lastMoved)]) - gain[depth];
         ++depth;
 
@@ -3166,7 +3317,7 @@ int Board::scoreMove(Move move, PieceColor sideToMove) const noexcept {
 
     // history is only meaningful for quiet moves, keep it out of capture / promotion ordering
     int score = (isCapture || isPromotion(move.Flag))
-        ? 0 : SearchContext::Data().HistoryTable[move.StartingSquare * (Ranks * Files) + move.TargetSquare];
+        ? 0 : SearchContext::Data().HistoryTable[SearchContext::HistoryIndex(sideToMove, move.StartingSquare, move.TargetSquare)];
 
     // 1. promotions (highest priority)
     if (isPromotion(move.Flag)) {
@@ -3209,11 +3360,24 @@ int Board::scoreMove(Move move, PieceColor sideToMove) const noexcept {
 
 #pragma region Quiescence
 
+static inline void PickBestMove(ScoredMove* moves, unsigned int count, unsigned int start) noexcept {
+    unsigned int best = start;
+
+    for (unsigned int j = start + 1u; j < count; ++j) {
+        if (moves[j].Score > moves[best].Score) best = j;
+    }
+
+    if (best != start) std::swap(moves[start], moves[best]);
+}
+
 int Board::quiescence(int alpha, int beta, PieceColor sideToMove, int ply) const {
     SearchContext::CountNode(ply);
 
+    const uint64_t checkMask = getCheckMask(sideToMove, GetOccupancyMap());
+
     // when in check standing pat is not allowed (we can't just "pass"), every evasion has to be searched
-    const bool inCheck = isUnderCheck(sideToMove);
+    const bool inCheck = checkMask != ~0ull;
+
     int standPat = -INF;
 
     if (!inCheck) {
@@ -3223,15 +3387,15 @@ int Board::quiescence(int alpha, int beta, PieceColor sideToMove, int ply) const
         if (standPat > alpha) alpha = standPat;
     }
 
-    Move captureMoves[MaxLegalMoves];
+    UninitArray<Move, MaxLegalMoves> captureMoves;
     unsigned int numCaptures = 0u;
 
-    if (inCheck) getAllLegalMoves(sideToMove, captureMoves, numCaptures);
-    else getAllCaptureMoves(sideToMove, captureMoves, numCaptures);
+    if (inCheck) getAllLegalMoves(sideToMove, checkMask, captureMoves, numCaptures);
+    else getAllCaptureMoves(sideToMove, checkMask, captureMoves, numCaptures);
 
     if (inCheck && numCaptures == 0u) return ply - INF; // checkmate
 
-    ScoredMove moves[MaxLegalMoves];
+    UninitArray<ScoredMove, MaxLegalMoves> moves;
     unsigned int numMoves = 0u;
 
     for (unsigned int i = 0u; i < numCaptures; ++i) {
@@ -3259,13 +3423,9 @@ int Board::quiescence(int alpha, int beta, PieceColor sideToMove, int ply) const
 
     if (numMoves == 0u) return alpha;
 
-    std::sort(moves, moves + numMoves,
-        [](const ScoredMove& a, const ScoredMove& b) {
-            return a.Score > b.Score;
-        }
-    );
-
     for (unsigned int i = 0u; i < numMoves; ++i) {
+        PickBestMove(moves, numMoves, i);
+
         Board copy = *this;
         copy.doMoveInternal(moves[i].Move);
 
@@ -3288,24 +3448,39 @@ static inline int depthReduction(int ply, int moveNumber) noexcept {
     return LUTs::Reduction[std::min(ply, SearchContext::MaxPly - 1)][std::min(moveNumber, SearchContext::MaxMoves - 1)];
 }
 
+[[nodiscard]]
+static inline int ContinuationKey(Piece piece, int to) noexcept {
+    return (static_cast<int>(piece.Type) + (piece.Color == PieceColor::Black ? 6 : 0)) * (Ranks * Files) + to;
+}
+
 int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int ply, int ext) const {
     if (SearchContext::Cancelled.load(std::memory_order_relaxed)) return SearchCancelScore;
 
     SearchContext::CountNode(ply);
 
-    // draw by game design
-    if (
-        FiftyMoveRule() ||
-        isThreefoldRepetition(ply) ||
-        HasInsufficientMaterial()
-    ) {
-        // penalize draws more when we have an advantage
-        const int stmEval = evaluate(sideToMove);
-        const bool engineToMove = sideToMove == SearchContext::RootSide;
-        const int engineEval = engineToMove ? stmEval : -stmEval;
-        const int drawForEngine = -std::clamp(Options::Contempt + engineEval / 20, -200, 200);
+    SearchThreadData& td = SearchContext::Data();
 
-        return engineToMove ? drawForEngine : -drawForEngine;
+    const bool pvNode = beta - alpha > 1;
+    const bool excluded = static_cast<bool>(td.ExcludedMove[ply]);
+
+    // draw by game design
+    {
+        const bool fifty = FiftyMoveRule();
+
+        if (fifty || isThreefoldRepetition(ply) || HasInsufficientMaterial()) {
+            // checkmate on the move that reaches the fifty move limit is still checkmate
+            const bool mated = fifty && isUnderCheck(sideToMove) && !HasAnyLegalMoves(sideToMove);
+
+            if (!mated) {
+                // penalize draws more when we have an advantage
+                const int stmEval = evaluate(sideToMove);
+                const bool engineToMove = sideToMove == SearchContext::RootSide;
+                const int engineEval = engineToMove ? stmEval : -stmEval;
+                const int drawForEngine = -std::clamp(Options::Contempt + engineEval / 20, -200, 200);
+
+                return engineToMove ? drawForEngine : -drawForEngine;
+            }
+        }
     }
 
     if (depth <= 0) {
@@ -3316,31 +3491,73 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
         return evaluate(sideToMove);
     }
 
+    // single transposition table lookup, used for the cutoff, move ordering and the singular extension
+    TranspositionTable::TTEntry tte;
+    const bool ttHit = GameContext::TT.Peek(m_Hash, tte);
+
     Move ttMove;
+    if (ttHit) {
+        ttMove = Move(tte.BestMove.StartingSquare, tte.BestMove.TargetSquare);
 
-    {
-        int ttScore;
+        const bool ttCutoffAllowed = !excluded && !(ply <= 6 && m_HalfMoveClock >= 2);
 
-        const bool ttCutoffAllowed = !(ply <= 6 && m_HalfMoveClock >= 2);
+        if (ttCutoffAllowed && tte.Depth >= depth) {
+            const bool usable =
+                tte.NodeFlag == TranspositionTable::TTFlag::Exact ||
+                (tte.NodeFlag == TranspositionTable::TTFlag::LowerBound && tte.Score >= beta) ||
+                (tte.NodeFlag == TranspositionTable::TTFlag::UpperBound && tte.Score <= alpha);
 
-        if (GameContext::TT.Probe(m_Hash, depth, alpha, beta, ttScore, ttMove) && ttCutoffAllowed) {
-            if (ttScore > MateThreshold)  return ttScore - ply;
-            if (ttScore < -MateThreshold) return ttScore + ply;
-            else return ttScore;
+            if (usable) {
+                if (tte.Score > MateThreshold)  return tte.Score - ply;
+                if (tte.Score < -MateThreshold) return tte.Score + ply;
+                return tte.Score;
+            }
         }
     }
 
-    const bool inCheck = isUnderCheck(sideToMove);
+    // (~0 = not in check, 0 = double check, otherwise the squares that capture / block the single checker)
+    const uint64_t checkMask = getCheckMask(sideToMove, GetOccupancyMap());
+    const bool inCheck = checkMask != ~0ull;
     const float endgameWeight = getEndgameWeight();
 
-    // computed once and shared by every pruning heuristic below
-    const int staticEval = evaluate(sideToMove, endgameWeight);
+    const int staticEval = inCheck ? SearchLimits::NoEval : evaluate(sideToMove, endgameWeight);
+    td.StaticEval[ply] = staticEval;
+
+    // is the position getting better for us compared to our last turn(s)? if not, prune / reduce more
+    bool improving = false;
+    if (!inCheck) {
+        if (ply >= 2 && td.StaticEval[ply - 2] != SearchLimits::NoEval) {
+            improving = staticEval > td.StaticEval[ply - 2];
+        } else if (ply >= 4 && td.StaticEval[ply - 4] != SearchLimits::NoEval) {
+            improving = staticEval > td.StaticEval[ply - 4];
+        }
+    }
+
+    // moves that lead into this node, for continuation history
+    const int contKey1 = td.ContKey[ply];
+    const int contKey2 = ply >= 1 ? td.ContKey[ply - 1] : -1;
+
+    // reverse futility pruning
+    if (
+        !pvNode && !inCheck && !excluded &&
+        depth <= 6 &&
+        std::abs(beta) < MateThreshold
+    ) {
+        if (staticEval - (120 * depth - (improving ? 60 : 0)) >= beta) {
+            return staticEval;
+        }
+    }
 
     // null move pruning
     if (
+        !pvNode && !inCheck && !excluded &&
+        !td.SkipNull[ply] &&
         depth >= 3 &&
-        !inCheck &&
-        endgameWeight < 0.6f
+        staticEval >= beta &&
+        endgameWeight < 0.6f &&
+        // zugzwang is only a real danger when the side to move has nothing but pawns and a king
+        (m_PieceMask[(sideToMove == PieceColor::Black ? 6 : 0) + 1] | m_PieceMask[(sideToMove == PieceColor::Black ? 6 : 0) + 2] |
+            m_PieceMask[(sideToMove == PieceColor::Black ? 6 : 0) + 3] | m_PieceMask[(sideToMove == PieceColor::Black ? 6 : 0) + 4])
     ) {
         Board copy = *this;
 
@@ -3351,126 +3568,140 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
         copy.m_EnPassantSquare = NullPos;
         copy.m_Hash = ZobristHasher::HashSideToMove(copy.m_Hash);
 
-        SearchContext::Data().PositionHistory[ply + 1] = copy.m_Hash;
+        td.PositionHistory[ply + 1] = copy.m_Hash;
+        td.ContKey[ply + 1] = -1;
+        td.SkipNull[ply + 1] = true; // no two null moves in a row
 
-        const int reduction = 2 + depth / 4;
+        const int reduction = 3 + depth / 4 + std::min((staticEval - beta) / 200, 2);
         const int score = -copy.negamax(
             depth - 1 - reduction, -beta, -beta + 1, InvertColor(sideToMove), ply + 1, ext
         );
 
+        td.SkipNull[ply + 1] = false;
+
         if (SearchContext::Cancelled.load(std::memory_order_relaxed)) return SearchCancelScore;
 
-        if (score >= beta) return beta;
+        // never trust a mate score that came out of a null move
+        if (score >= beta) return score >= MateThreshold ? beta : score;
     }
 
     // probcut
     if (
+        !pvNode && !inCheck && !excluded &&
         depth >= 5 &&
         std::abs(beta) < MateThreshold
     ) {
         const int probcutBeta = beta + 200;
 
-        Move legalMoves[MaxLegalMoves];
-        unsigned int numMoves = 0u;
-        getAllLegalMoves(sideToMove, legalMoves, numMoves);
+        // only captures are ever tried here, so only generate captures (instead of all legal moves)
+        UninitArray<Move, MaxLegalMoves> captureMoves;
+        unsigned int numCaptures = 0u;
+        getAllCaptureMoves(sideToMove, checkMask, captureMoves, numCaptures);
 
-        for (unsigned int i = 0; i < numMoves; ++i) {
-            const Move move = legalMoves[i];
+        for (unsigned int i = 0; i < numCaptures; ++i) {
+            const Move move = captureMoves[i];
 
-            if (
-                !HasFlag(move.Flag, MoveFlag::Capture) ||
-                see(move) < probcutBeta - staticEval
-            ) {
+            if (see(move) < probcutBeta - staticEval) {
                 continue;
             }
 
             Board copy = *this;
             copy.doMoveInternal(move);
 
-            SearchContext::Data().PositionHistory[ply + 1] = copy.m_Hash;
+            td.PositionHistory[ply + 1] = copy.m_Hash;
+            td.ContKey[ply + 1] = ContinuationKey(m_Mailbox[move.StartingSquare], move.TargetSquare);
 
             const int score = -copy.negamax(
                 depth - 4, -probcutBeta, -probcutBeta + 1, InvertColor(sideToMove), ply + 1, ext
             );
 
+            if (SearchContext::Cancelled.load(std::memory_order_relaxed)) return SearchCancelScore;
+
             if (score >= probcutBeta) return score;
         }
     }
 
-    // reverse futility pruning
-    if (
-        depth <= 6 &&
-        !inCheck &&
-        std::abs(beta) < MateThreshold
-    ) {
-        if (staticEval - 120 * depth >= beta) {
-            return staticEval;
-        }
+    // internal iterative reduction: without a TT move this node is poorly ordered, don't spend full depth on it
+    if (!inCheck && depth >= 4 && !ttMove) {
+        --depth;
     }
 
-    // singular extension
+    // singular extension: if the TT move is much better than everything else it deserves more depth
     int singularExtension = 0;
 
     if (
+        !excluded && !inCheck &&
         depth >= 6 &&
         ext < SearchContext::MaxExt &&
-        ttMove &&
-        !inCheck
+        ttMove && ttHit &&
+        tte.Depth >= depth - 3 &&
+        tte.NodeFlag != TranspositionTable::TTFlag::UpperBound &&
+        std::abs(tte.Score) < MateThreshold
     ) {
-        TranspositionTable::TTEntry entry;
+        const int singularBeta = tte.Score - 2 * depth;
 
-        if (GameContext::TT.Peek(m_Hash, entry)) {
-            if (
-                entry.Depth >= depth - 3 &&
-                entry.NodeFlag != TranspositionTable::TTFlag::UpperBound &&
-                std::abs(entry.Score) < MateThreshold
-            ) {
-                const int singularBeta = entry.Score - 2 * depth;
+        td.ExcludedMove[ply] = ttMove;
 
-                SearchContext::Data().ExcludedMove[ply] = ttMove;
+        const int singularScore = negamax(
+            (depth - 1) / 2, singularBeta - 1, singularBeta, sideToMove, ply, ext + 1
+        );
 
-                const int singularScore = negamax(
-                    depth / 2, singularBeta - 1, singularBeta, sideToMove, ply, ext + 1
-                );
+        td.ExcludedMove[ply] = Move();
 
-                if (singularScore < singularBeta) {
-                    singularExtension = 1;
-                }
+        if (SearchContext::Cancelled.load(std::memory_order_relaxed)) return SearchCancelScore;
 
-                SearchContext::Data().ExcludedMove[ply] = Move();
-            }
+        if (singularScore < singularBeta) {
+            singularExtension = 1;
+
+            // far below the bar, in a non PV node: extend twice
+            if (!pvNode && singularScore < singularBeta - 40) singularExtension = 2;
+        } else if (singularBeta >= beta) {
+            // multi-cut: even without the TT move this node fails high
+            return singularBeta;
+        } else if (tte.Score >= beta) {
+            // the TT move is probably good enough on its own, but nothing singular about it: search less
+            singularExtension = -1;
         }
     }
 
-    ScoredMove moves[MaxLegalMoves];
+    UninitArray<ScoredMove, MaxLegalMoves> moves;
     unsigned int numMoves = 0u;
 
     {
-        Move legalMoves[MaxLegalMoves];
+        UninitArray<Move, MaxLegalMoves> legalMoves;
         unsigned int numLegal = 0u;
 
-        getAllLegalMoves(sideToMove, legalMoves, numLegal);
+        getAllLegalMoves(sideToMove, checkMask, legalMoves, numLegal);
 
         for (unsigned int i = 0u; i < numLegal; ++i) {
             const Move move = legalMoves[i];
 
-            if (move == SearchContext::Data().ExcludedMove[ply]) continue;
+            if (move == td.ExcludedMove[ply]) continue;
 
             int moveScore = scoreMove(move, sideToMove);
+
+            const bool isCapture = HasFlag(move.Flag, MoveFlag::Capture);
 
             // give massive boost to best move from TT
             if (move == ttMove) {
                 moveScore += INF;
-            }
+            } else if (isCapture) {
+                // a capture that looks losing by piece values may still be fine (e.g. the victim is undefended)
+                const int victimValue = HasFlag(move.Flag, MoveFlag::EnPassant)
+                    ? PieceValues[0] : PieceValues[static_cast<int>(m_Mailbox[move.TargetSquare].Type)];
 
-            // give score to quiet moves if they are actually killer
-            else if (
-                !HasFlag(move.Flag, MoveFlag::Capture) &&
-                !HasFlag(move.Flag, MoveFlag::Check) &&
-                !isPromotion(move.Flag)
-            ) {
-                if (move == SearchContext::Data().killerMoves[ply][0]) moveScore += 5000;
-                if (move == SearchContext::Data().killerMoves[ply][1]) moveScore += 4000;
+                if (victimValue < PieceValues[static_cast<int>(m_Mailbox[move.StartingSquare].Type)] && see(move) >= 0) {
+                    moveScore += 8000;
+                }
+            } else if (!isPromotion(move.Flag)) {
+                const int key = ContinuationKey(m_Mailbox[move.StartingSquare], move.TargetSquare);
+                moveScore += SearchContext::ContHistoryScore(contKey1, key) + SearchContext::ContHistoryScore(contKey2, key);
+
+                // give score to quiet moves if they are actually killer
+                if (!HasFlag(move.Flag, MoveFlag::Check)) {
+                    if (move == td.killerMoves[ply][0]) moveScore += 5000;
+                    if (move == td.killerMoves[ply][1]) moveScore += 4000;
+                }
             }
 
             moves[numMoves++] = ScoredMove(move, moveScore);
@@ -3478,7 +3709,7 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
     }
 
     if (numMoves == 0u) {
-        if (SearchContext::Data().ExcludedMove[ply]) {
+        if (excluded) {
             return alpha;
         }
 
@@ -3499,95 +3730,122 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
         return 0; // stalemate
     }
 
-    std::sort(moves, moves + numMoves,
-        [](const ScoredMove& a, const ScoredMove& b) {
-            return a.Score > b.Score;
-        }
-    );
-
     int bestScore = -INF;
-    int originalAlpha = alpha;
+    const int originalAlpha = alpha;
     Move bestMove;
 
-    Move quietsTried[MaxLegalMoves];
+    UninitArray<Move, MaxLegalMoves> quietsTried;
     unsigned int numQuietsTried = 0u;
 
     for (unsigned int i = 0u; i < numMoves; ++i) {
-        Move move = moves[i].Move;
+        // lazy selection sort: only the moves that are actually reached get ordered
+        PickBestMove(moves, numMoves, i);
 
-        static constexpr int LMPTable[] = {0, 8, 12, 18, 24};
+        const Move move = moves[i].Move;
 
-        // late move pruning
-        if (
-            depth <= 4 &&
-            !inCheck &&
-            i >= LMPTable[depth] &&
-            !HasFlag(move.Flag, MoveFlag::Capture) &&
-            !HasFlag(move.Flag, MoveFlag::Check) &&
-            !isPromotion(move.Flag)
-        ) {
-            continue;
+        const bool isCapture = HasFlag(move.Flag, MoveFlag::Capture);
+        const bool isCheckMove = HasFlag(move.Flag, MoveFlag::Check);
+        const bool isPromo = isPromotion(move.Flag);
+        const bool isQuiet = !isCapture && !isCheckMove && !isPromo;
+
+        const Piece mover = m_Mailbox[move.StartingSquare];
+        const int contKey = ContinuationKey(mover, move.TargetSquare);
+
+        // combined history score of this move, used for pruning and reductions
+        int histScore = 0;
+        if (isQuiet) {
+            histScore =
+                td.HistoryTable[SearchContext::HistoryIndex(sideToMove, move.StartingSquare, move.TargetSquare)] +
+                SearchContext::ContHistoryScore(contKey1, contKey) +
+                SearchContext::ContHistoryScore(contKey2, contKey);
+        }
+
+        // pruning of moves that are very unlikely to matter. Never done for the first move, when in check,
+        if (!inCheck && bestScore > -MateThreshold) {
+            static constexpr int LMPTable[] = {0, 8, 12, 18, 24};
+
+            // late move pruning
+            if (isQuiet && depth <= 4 && i >= static_cast<unsigned>(LMPTable[depth] >> (improving ? 0 : 1))) {
+                continue;
+            }
+
+            // futility pruning: the static eval is so far below alpha that a quiet move can't realistically recover
+            if (isQuiet && depth <= 5 && staticEval + 100 + 90 * depth <= alpha) {
+                continue;
+            }
+
+            // moves that lose a lot of material by exchange, at low depth
+            if (!pvNode && isCapture && depth <= 5 && see(move) < -100 * depth) {
+                continue;
+            }
         }
 
         Board copy = *this;
         copy.doMoveInternal(move);
 
-        SearchContext::Data().PositionHistory[ply + 1] = copy.m_Hash;
+        // start loading the child's TT slot now, it is probed as soon as the child node starts
+        GameContext::TT.Prefetch(copy.m_Hash);
+
+        td.PositionHistory[ply + 1] = copy.m_Hash;
+        td.ContKey[ply + 1] = contKey;
 
         int extension = 0;
-        if (ext < SearchContext::MaxExt) {
-            extension += getSearchExtension(move);
-            if (move == ttMove) extension += singularExtension;
-        }
+        if (ext < SearchContext::MaxExt) extension += getSearchExtension(move);
+        if (move == ttMove && !(singularExtension > 0 && ext >= SearchContext::MaxExt)) extension += singularExtension;
+        extension = std::min(extension, 2);
 
-        const int newExt = ext + extension;
+        const int newExt = ext + std::max(extension, 0);
         const int nextDepth = depth - 1 + extension;
 
         int score;
 
-        // late move reduction with history table
-        if (
-            depth >= 3 && i > 2 &&
-            !HasFlag(move.Flag, MoveFlag::Capture) &&
-            !HasFlag(move.Flag, MoveFlag::Check)
-        ) {
-            int reduction = depthReduction(depth, i + 1);
-
-            // reduce reduction for promising moves
-            {
-                const int histScore = SearchContext::Data().HistoryTable[move.StartingSquare * (Ranks * Files) + move.TargetSquare];
-                // good history -> reduce less, bad history -> reduce more
-                reduction = std::max(1, reduction - histScore / 4096);
-            }
-
-            score = -copy.negamax(nextDepth - reduction, -beta, -alpha, InvertColor(sideToMove), ply + 1, newExt);
-
-            if (SearchContext::Cancelled.load(std::memory_order_relaxed)) return SearchCancelScore;
-
-            // Re-search if the move looks good
-            if (score > alpha) {
-                score = -copy.negamax(nextDepth, -beta, -alpha, InvertColor(sideToMove), ply + 1, newExt);
-
-                if (SearchContext::Cancelled.load(std::memory_order_relaxed)) return SearchCancelScore;
-            }
+        if (i == 0) {
+            // first move: full window
+            score = -copy.negamax(nextDepth, -beta, -alpha, InvertColor(sideToMove), ply + 1, newExt);
         } else {
-            if (i == 0) {
-                // first move: full window
-                score = -copy.negamax(nextDepth, -beta, -alpha, InvertColor(sideToMove), ply + 1, newExt);
+            bool searchFull = true;
+
+            // late move reduction
+            if (depth >= 3 && i > 2 && !isCapture && !isCheckMove) {
+                int reduction = depthReduction(depth, i + 1);
+
+                if (pvNode) --reduction;
+                if (!improving) ++reduction;
+                if (move == td.killerMoves[ply][0] || move == td.killerMoves[ply][1]) --reduction;
+
+                // good history -> reduce less, bad history -> reduce more
+                reduction -= std::clamp(histScore / 5000, -2, 2);
+
+                if (reduction > 0) {
+                    const int reducedDepth = std::max(1, nextDepth - reduction);
+
+                    score = -copy.negamax(reducedDepth, -alpha - 1, -alpha, InvertColor(sideToMove), ply + 1, newExt);
+
+                    if (SearchContext::Cancelled.load(std::memory_order_relaxed)) return SearchCancelScore;
+
+                    // only look at it again at full depth if the reduced search surprised us
+                    searchFull = score > alpha && reducedDepth < nextDepth;
+                } else {
+                    score = alpha + 1; // forces the scout below
+                }
             } else {
-                // scout with null window
+                score = alpha + 1;
+            }
+
+            // scout with a null window at full depth
+            if (searchFull) {
                 score = -copy.negamax(nextDepth, -alpha - 1, -alpha, InvertColor(sideToMove), ply + 1, newExt);
 
                 if (SearchContext::Cancelled.load(std::memory_order_relaxed)) return SearchCancelScore;
-
-                // re-search with full window if scout beat alpha
-                if (score > alpha && score < beta) {
-                    score = -copy.negamax(nextDepth, -beta, -alpha, InvertColor(sideToMove), ply + 1, newExt);
-                }
             }
 
-            if (SearchContext::Cancelled.load(std::memory_order_relaxed)) return SearchCancelScore;
+            // re-search with the full window if the scout landed inside it (PV nodes only, otherwise beta = alpha + 1)
+            if (score > alpha && score < beta) {
+                score = -copy.negamax(nextDepth, -beta, -alpha, InvertColor(sideToMove), ply + 1, newExt);
+            }
         }
+
+        if (SearchContext::Cancelled.load(std::memory_order_relaxed)) return SearchCancelScore;
 
         if (score > bestScore) {
             bestScore = score;
@@ -3598,38 +3856,35 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
             alpha = score;
         }
 
-        if (
-            alpha < beta && numQuietsTried < MaxLegalMoves &&
-            !HasFlag(move.Flag, MoveFlag::Capture) &&
-            !HasFlag(move.Flag, MoveFlag::Check) &&
-            !isPromotion(move.Flag)
-        ) {
-            quietsTried[numQuietsTried++] = move;
-        }
-
         if (alpha >= beta) {
-
             // what seemed like a quiet move, is actually killer
-            if (
-                !HasFlag(move.Flag, MoveFlag::Capture) &&
-                !HasFlag(move.Flag, MoveFlag::Check) &&
-                !isPromotion(move.Flag)
-            ) {
-                {
-                    const int bonus = std::min(depth * depth * 4, 1600);
-                    SearchContext::UpdateHistory(move.StartingSquare, move.TargetSquare, bonus);
+            if (isQuiet) {
+                const int bonus = std::min(depth * depth * 4, 1600);
 
-                    // quiet moves that were tried earlier and failed to cut get penalised
-                    for (unsigned int q = 0u; q < numQuietsTried; ++q) {
-                        SearchContext::UpdateHistory(quietsTried[q].StartingSquare, quietsTried[q].TargetSquare, -bonus);
-                    }
+                SearchContext::UpdateHistory(sideToMove, move.StartingSquare, move.TargetSquare, bonus);
+                SearchContext::UpdateContHistory(contKey1, contKey, bonus);
+                SearchContext::UpdateContHistory(contKey2, contKey, bonus);
+
+                // quiet moves that were tried earlier and failed to cut get penalised
+                for (unsigned int q = 0u; q < numQuietsTried; ++q) {
+                    const Move failed = quietsTried[q];
+                    const int failedKey = ContinuationKey(m_Mailbox[failed.StartingSquare], failed.TargetSquare);
+
+                    SearchContext::UpdateHistory(sideToMove, failed.StartingSquare, failed.TargetSquare, -bonus);
+                    SearchContext::UpdateContHistory(contKey1, failedKey, -bonus);
+                    SearchContext::UpdateContHistory(contKey2, failedKey, -bonus);
                 }
+
                 // add to the shift register
-                SearchContext::Data().killerMoves[ply][1] = SearchContext::Data().killerMoves[ply][0];
-                SearchContext::Data().killerMoves[ply][0] = move;
+                td.killerMoves[ply][1] = td.killerMoves[ply][0];
+                td.killerMoves[ply][0] = move;
             }
 
             break;
+        }
+
+        if (isQuiet && numQuietsTried < MaxLegalMoves) {
+            quietsTried[numQuietsTried++] = move;
         }
     }
 
@@ -3642,8 +3897,12 @@ int Board::negamax(int depth, int alpha, int beta, PieceColor sideToMove, int pl
     if (bestScore > MateThreshold) ttStoreScore = bestScore + ply;
     if (bestScore < -MateThreshold) ttStoreScore = bestScore - ply;
 
-    if (!SearchContext::Data().ExcludedMove[ply]) {
-        GameContext::TT.Store(m_Hash, depth, ttStoreScore, flag, bestMove);
+    if (!excluded) {
+        // a fail low node has no real best move, don't let it pollute move ordering
+        GameContext::TT.Store(
+            m_Hash, depth, ttStoreScore, flag,
+            flag == TranspositionTable::TTFlag::UpperBound ? Move() : bestMove
+        );
     }
 
     return bestScore;
@@ -3653,9 +3912,117 @@ int Board::evaluateMove(Move move, PieceColor sideToMove, int depth, int alpha, 
     Board copy = *this;
     copy.doMoveInternal(move);
 
-    SearchContext::Data().PositionHistory[1] = copy.m_Hash;
+    SearchThreadData& td = SearchContext::Data();
+
+    td.PositionHistory[1] = copy.m_Hash;
+    td.ContKey[0] = -1;
+    td.ContKey[1] = ContinuationKey(m_Mailbox[move.StartingSquare], move.TargetSquare);
 
     return -copy.negamax(depth - 1, -beta, -alpha, InvertColor(sideToMove));
+}
+
+bool Board::searchRoot(
+    Move* moves, unsigned int numMoves, PieceColor sideToMove, int depth,
+    Move& bestMove, int& bestScore, bool allowPartial
+) const {
+    const auto cancelled = []() { return SearchContext::Cancelled.load(std::memory_order_relaxed); };
+
+    int rootScores[MaxLegalMoves];
+
+    int delta = 25;
+    int aspirationAlpha = (depth >= 4 && bestScore > -INF) ? bestScore - delta : -INF;
+    int aspirationBeta = (depth >= 4 && bestScore < INF) ? bestScore + delta : INF;
+
+    Move iterationBest = bestMove;
+    int iterationScore = -INF;
+
+    while (true) {
+        int alpha = aspirationAlpha;
+        const int beta = aspirationBeta;
+
+        iterationScore = -INF;
+        bool failedHigh = false;
+
+        for (unsigned int i = 0u; i < numMoves; ++i) {
+            rootScores[i] = -INF;
+        }
+
+        for (unsigned int i = 0u; i < numMoves; ++i) {
+            const Move move = moves[i];
+
+            int score;
+
+            if (i == 0u) {
+                score = evaluateMove(move, sideToMove, depth, alpha, beta);
+            } else {
+                // principal variation search: only the best move needs an exact score, so scout with a null window
+                score = evaluateMove(move, sideToMove, depth, alpha, alpha + 1);
+
+                if (!cancelled() && score > alpha && score < beta) {
+                    score = evaluateMove(move, sideToMove, depth, alpha, beta);
+                }
+            }
+
+            if (cancelled()) {
+                if (allowPartial && score != SearchCancelScore && score != -SearchCancelScore && score > bestScore) {
+                    bestMove = move;
+                    bestScore = score;
+                }
+
+                return false;
+            }
+
+            rootScores[i] = score;
+
+            if (score > iterationScore) {
+                iterationScore = score;
+                iterationBest = move;
+            }
+
+            if (score > alpha) alpha = score;
+
+            // the true score is at least beta: stop here and search again with a wider window,
+            // the remaining moves would only be searched with an empty window
+            if (score >= beta) {
+                failedHigh = true;
+                break;
+            }
+        }
+
+        if (failedHigh) {
+            aspirationBeta = delta > 400 ? INF : std::min<int>(INF, aspirationBeta + delta);
+            delta *= 2;
+            continue;
+        }
+
+        if (iterationScore <= aspirationAlpha && aspirationAlpha > -INF) {
+            aspirationAlpha = delta > 400 ? -INF : std::max<int>(-INF, aspirationAlpha - delta);
+            delta *= 2;
+            continue;
+        }
+
+        break; // the score is inside the window, accept it
+    }
+
+    bestMove = iterationBest;
+    bestScore = iterationScore;
+
+    // best move first, then by the scores of this iteration
+    unsigned int order[MaxLegalMoves];
+    for (unsigned int i = 0u; i < numMoves; ++i) order[i] = i;
+
+    std::stable_sort(order, order + numMoves, [&](unsigned int a, unsigned int b) {
+        const bool aBest = moves[a] == bestMove;
+        const bool bBest = moves[b] == bestMove;
+        if (aBest != bBest) return aBest;
+        return rootScores[a] > rootScores[b];
+    });
+
+    Move sorted[MaxLegalMoves];
+    for (unsigned int i = 0u; i < numMoves; ++i) sorted[i] = moves[order[i]];
+    for (unsigned int i = 0u; i < numMoves; ++i) moves[i] = sorted[i];
+
+    return true;
 }
 
 #pragma region Find By Time
@@ -3690,69 +4057,18 @@ void Board::searchHelper(PieceColor sideToMove, int helperId) const {
             }
         );
 
+        Move rootMoves[MaxLegalMoves];
+        for (unsigned int i = 0u; i < numMoves; ++i) rootMoves[i] = allMoves[i].Move;
+
         const int idx = (helperId - 1) % 20;
+
+        Move bestMove = rootMoves[0];
         int bestScore = -INF;
 
         for (int depth = 1; depth <= 96 && !SearchContext::Cancelled.load(std::memory_order_relaxed); ++depth) {
             if (((depth + SkipPhase[idx]) / SkipSize[idx]) % 2) continue;
 
-            Move iterationBestMove = allMoves[0].Move;
-            int iterationBestScore = -INF;
-
-            int aspirationDelta = 50;
-            int aspirationAlpha = (depth >= 4 && bestScore > -INF) ? bestScore - aspirationDelta : -INF;
-            int aspirationBeta = (depth >= 4 && bestScore < INF) ? bestScore + aspirationDelta : INF;
-
-            bool cancelled = false;
-
-            while (true) {
-                int alpha = aspirationAlpha;
-                iterationBestScore = -INF;
-
-                for (unsigned int i = 0u; i < numMoves; ++i) {
-                    const Move move = allMoves[i].Move;
-                    const int score = evaluateMove(move, sideToMove, depth, alpha, aspirationBeta);
-
-                    if (SearchContext::Cancelled.load(std::memory_order_relaxed)) {
-                        cancelled = true;
-                        break;
-                    }
-
-                    if (score > iterationBestScore) {
-                        iterationBestScore = score;
-                        iterationBestMove = move;
-                    }
-
-                    if (score > alpha) alpha = score;
-                }
-
-                if (cancelled) break;
-
-                if (iterationBestScore <= aspirationAlpha) {
-                    aspirationAlpha -= aspirationDelta;
-                    aspirationDelta *= 2;
-                } else if (iterationBestScore >= aspirationBeta) {
-                    aspirationBeta += aspirationDelta;
-                    aspirationDelta *= 2;
-                } else {
-                    break;
-                }
-            }
-
-            if (cancelled) break;
-
-            bestScore = iterationBestScore;
-
-            // search the best move first on the next iteration
-            auto it = std::find_if(allMoves, allMoves + numMoves,
-                [&](const ScoredMove& sm) {
-                    return sm.Move == iterationBestMove;
-                }
-            );
-
-            if (it != allMoves && it != allMoves + numMoves) {
-                std::iter_swap(allMoves, it);
-            }
+            if (!searchRoot(rootMoves, numMoves, sideToMove, depth, bestMove, bestScore, false)) break;
         }
     }
 
@@ -3760,16 +4076,14 @@ void Board::searchHelper(PieceColor sideToMove, int helperId) const {
 }
 
 namespace {
-    std::vector<std::thread> StartHelperThreads(const Board& root, PieceColor sideToMove) {
+    std::vector<std::thread> StartHelperThreads(const std::function<void(int)>& work) {
         std::vector<std::thread> helpers;
 
         const int count = std::clamp(Options::Threads, 1, 128) - 1;
         helpers.reserve(count);
 
         for (int i = 1; i <= count; ++i) {
-            helpers.emplace_back([root, sideToMove, i]() {
-                root.searchHelper(sideToMove, i);
-            });
+            helpers.emplace_back([work, i]() { work(i); });
         }
 
         return helpers;
@@ -3872,75 +4186,18 @@ Move Board::FindBestMoveByTime(PieceColor sideToMove, int thinkTimeMS, bool useO
         SearchContext::Cancelled.store(true, std::memory_order_relaxed);
     });
 
-    std::vector<std::thread> helperThreads = StartHelperThreads(*this, sideToMove);
+    std::vector<std::thread> helperThreads = StartHelperThreads(
+        [root = *this, sideToMove](int i) { root.searchHelper(sideToMove, i); }
+    );
+
+    Move rootMoves[MaxLegalMoves];
+    for (unsigned int i = 0u; i < numMoves; ++i) rootMoves[i] = allMoves[i].Move;
 
     // iterative deepening
-    for (int depth = 1; !SearchContext::Cancelled.load(std::memory_order_relaxed); ++depth) {
-        Move iterationBestMove = bestMove;
-        int iterationBestScore = -INF;
-
-        // aspiration window
-        int aspirationDelta = 50;
-        int aspirationAlpha = (depth >= 4 && bestScore > -INF) ? bestScore - aspirationDelta : -INF;
-        int aspirationBeta = (depth >= 4 && bestScore < INF) ? bestScore + aspirationDelta : INF;
-
-        while (true) {
-            int alpha = aspirationAlpha;
-            iterationBestScore = -INF;
-
-            for (unsigned int i = 0u; i < numMoves; ++i) {
-                const ScoredMove sm = allMoves[i];
-
-                const int score = evaluateMove(sm.Move, sideToMove, depth, alpha, aspirationBeta);
-
-                if (SearchContext::Cancelled.load(std::memory_order_relaxed)) {
-                    if (score != SearchCancelScore && score != -SearchCancelScore && score > bestScore) {
-                        bestMove = sm.Move;
-                        bestScore = score;
-                    }
-
-                    break;
-                }
-
-                if (score > iterationBestScore) {
-                    iterationBestScore = score;
-                    iterationBestMove = sm.Move;
-                }
-
-                if (score > alpha) alpha = score;
-            }
-
-            if (SearchContext::Cancelled.load(std::memory_order_relaxed)) break;
-
-            // widen window if we fell outside
-            if (iterationBestScore <= aspirationAlpha) {
-                aspirationAlpha -= aspirationDelta;
-                aspirationDelta *= 2;
-            } else if (iterationBestScore >= aspirationBeta) {
-                aspirationBeta += aspirationDelta;
-                aspirationDelta *= 2;
-            } else {
-                break; // score inside window, accept it
-            }
-        }
-
-        if (SearchContext::Cancelled.load(std::memory_order_relaxed)) break;
-
-        bestMove = iterationBestMove;
-        bestScore = iterationBestScore;
+    for (int depth = 1; depth <= 96 && !SearchContext::Cancelled.load(std::memory_order_relaxed); ++depth) {
+        if (!searchRoot(rootMoves, numMoves, sideToMove, depth, bestMove, bestScore, true)) break;
 
         PrintUciInfo(depth, bestScore, bestMove, searchStart);
-
-        // reorder so the best move is searched first next iteration
-        auto it = std::find_if(allMoves, allMoves + numMoves,
-            [&](const ScoredMove& sm) {
-                return sm.Move == bestMove;
-            }
-        );
-
-        if (it != allMoves && it != allMoves + numMoves) {
-            std::iter_swap(allMoves, it);
-        }
     }
 
     StopHelperThreads(helperThreads);
@@ -3996,74 +4253,18 @@ Move Board::FindBestMoveByDepth(PieceColor sideToMove, int targetDepth, bool use
 
     const auto searchStart = std::chrono::steady_clock::now();
 
-    std::vector<std::thread> helperThreads = StartHelperThreads(*this, sideToMove);
+    std::vector<std::thread> helperThreads = StartHelperThreads(
+        [root = *this, sideToMove](int i) { root.searchHelper(sideToMove, i); }
+    );
+
+    Move rootMoves[MaxLegalMoves];
+    for (unsigned int i = 0u; i < numMoves; ++i) rootMoves[i] = allMoves[i].Move;
 
     // iterative deepening
     for (int depth = 1; depth <= targetDepth && !SearchContext::Cancelled.load(std::memory_order_relaxed); ++depth) {
-        Move iterationBestMove = bestMove;
-        int iterationBestScore = -INF;
-
-        int aspirationDelta = 50;
-        int aspirationAlpha = (depth >= 4 && bestScore > -INF) ? bestScore - aspirationDelta : -INF;
-        int aspirationBeta = (depth >= 4 && bestScore < INF) ? bestScore + aspirationDelta : INF;
-
-        while (true) {
-            int alpha = aspirationAlpha;
-            iterationBestScore = -INF;
-
-            for (unsigned int i = 0u; i < numMoves; ++i) {
-                const ScoredMove sm = allMoves[i];
-
-                const int score = evaluateMove(sm.Move, sideToMove, depth, alpha, aspirationBeta);
-
-                if (SearchContext::Cancelled.load(std::memory_order_relaxed)) {
-                    if (score != SearchCancelScore && score != -SearchCancelScore && score > bestScore) {
-                        bestMove = sm.Move;
-                        bestScore = score;
-                    }
-
-                    break;
-                }
-
-                if (score > iterationBestScore) {
-                    iterationBestScore = score;
-                    iterationBestMove = sm.Move;
-                }
-
-                if (score > alpha) alpha = score;
-            }
-
-            // widen window if we fell outside
-            if (iterationBestScore <= aspirationAlpha) {
-                aspirationAlpha -= aspirationDelta;
-                aspirationDelta *= 2;
-            } else if (iterationBestScore >= aspirationBeta) {
-                aspirationBeta += aspirationDelta;
-                aspirationDelta *= 2;
-            } else {
-                break; // score inside window, accept it
-            }
-
-            if (SearchContext::Cancelled.load(std::memory_order_relaxed)) break;
-        }
-
-        if (SearchContext::Cancelled.load(std::memory_order_relaxed)) break;
-
-        bestMove = iterationBestMove;
-        bestScore = iterationBestScore;
+        if (!searchRoot(rootMoves, numMoves, sideToMove, depth, bestMove, bestScore, true)) break;
 
         PrintUciInfo(depth, bestScore, bestMove, searchStart);
-
-        // reorder so the best move is searched first next iteration
-        auto it = std::find_if(allMoves, allMoves + numMoves,
-            [&](const ScoredMove& sm) {
-                return sm.Move == bestMove;
-            }
-        );
-
-        if (it != allMoves && it != allMoves + numMoves) {
-            std::iter_swap(allMoves, it);
-        }
     }
 
     StopHelperThreads(helperThreads);
@@ -4080,7 +4281,7 @@ void Board::CancelSearch() {
 unsigned int Board::numPositions(int depth, PieceColor sideToMove) {
     if (depth <= 0) return 1;
 
-    Move moves[MaxLegalMoves];
+    UninitArray<Move, MaxLegalMoves> moves;
     unsigned int numMoves = 0u;
 
     getAllLegalMoves(sideToMove, moves, numMoves);
@@ -4100,7 +4301,7 @@ unsigned int Board::numPositions(int depth, PieceColor sideToMove) {
 }
 
 void Board::Perft(int depth, PieceColor sideToMove) {
-    Move moves[MaxLegalMoves];
+    UninitArray<Move, MaxLegalMoves> moves;
     unsigned int numMoves = 0u;
 
     getAllLegalMoves(sideToMove, moves, numMoves);

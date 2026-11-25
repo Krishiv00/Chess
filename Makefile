@@ -14,7 +14,7 @@ SFML_LIB := C:/SFML/lib
 
 CXX := g++
 STD := -std=c++23
-MAKEFLAGS += -j
+MAKEFLAGS += -j8
 
 rwildcard = $(foreach d,$(wildcard $(1:=/*)),$(call rwildcard,$d,$2) $(filter $(subst *,%,$2),$d))
 

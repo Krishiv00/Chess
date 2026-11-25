@@ -5,6 +5,7 @@
 #include <sstream>
 #include <cstring>
 
+#define CHESS_EXPOSE_INTERNALS
 #include "../include/Engine/Chess.hpp"
 
 struct BookEntry {

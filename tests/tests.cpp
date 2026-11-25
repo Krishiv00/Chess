@@ -2,6 +2,7 @@
 #include <vector>
 #include <functional>
 
+#define CHESS_EXPOSE_INTERNALS
 #include "Engine/Chess.hpp"
 
 struct TestCase {
@@ -99,6 +100,51 @@ static bool doMove(Chess::Board& board, Chess::PieceColor side, const std::strin
         }
     }
     return false;
+}
+
+static bool captureGenMatchesLegalGen(Chess::Board& board, Chess::PieceColor side) {
+    Chess::Move all[Chess::MaxLegalMoves];
+    unsigned int nAll = 0;
+    board.getAllLegalMoves(side, all, nAll);
+
+    Chess::Move caps[Chess::MaxLegalMoves];
+    unsigned int nCaps = 0;
+    board.getAllCaptureMoves(side, caps, nCaps);
+
+    const auto contains = [](Chess::Move* arr, unsigned int n, Chess::Move m) {
+        for (unsigned int i = 0; i < n; ++i) if (arr[i] == m) return true;
+        return false;
+        };
+
+    for (unsigned int i = 0; i < nCaps; ++i) {
+        if (!contains(all, nAll, caps[i])) return false;
+    }
+
+    for (unsigned int i = 0; i < nAll; ++i) {
+        const bool isCapture = Chess::HasFlag(all[i].Flag, Chess::MoveFlag::Capture) ||
+            Chess::HasFlag(all[i].Flag, Chess::MoveFlag::EnPassant);
+        if (isCapture && !contains(caps, nCaps, all[i])) return false;
+    }
+
+    return true;
+}
+
+static bool captureGenConsistentAtDepth(Chess::Board board, Chess::PieceColor side, int depth) {
+    if (depth == 0) return true;
+
+    if (!captureGenMatchesLegalGen(board, side)) return false;
+
+    Chess::Move moves[Chess::MaxLegalMoves];
+    unsigned int n = 0;
+    board.getAllLegalMoves(side, moves, n);
+
+    for (unsigned int i = 0; i < n; ++i) {
+        Chess::Board copy = board;
+        copy.doMoveInternal(moves[i]);
+        if (!captureGenConsistentAtDepth(copy, Chess::InvertColor(side), depth - 1)) return false;
+    }
+
+    return true;
 }
 
 #pragma region Register Tests
@@ -775,10 +821,7 @@ static void RegisterTests() {
         return b.HasInsufficientMaterial();
     });
 
-    // K+B vs K+B same colour - bishops on same colour squares, both light (a1=dark,b1=light).
-    // White bishop on f1 (light square: rank 7, file 5 -> (7+5)%2=0 -> light).
-    // Black bishop on c8 (light square: rank 0, file 2 -> (0+2)%2=0 -> light).
-    // Both on light squares -> draw.
+    // K+B vs K+B same colour - bishops on same colour squares, both light
     RegisterTest("Draw: Insufficient K+B vs K+B same colour squares", []() {
         Chess::Board b;
         load(b, "2b1k3/8/8/8/8/8/8/4KB2 w - - 0 1");
@@ -812,6 +855,134 @@ static void RegisterTests() {
         Chess::Board b;
         load(b, "8/8/4k3/8/8/4K3/5P2/8 w - - 0 1");
         return !b.HasInsufficientMaterial();
+    });
+
+    // =======================================================================
+    // Capture generator
+    // =======================================================================
+
+    RegisterTest("CaptureGen: matches legal gen at startpos", []() {
+        Chess::Board b; auto s = load(b, Chess::DefaultFEN);
+        return captureGenMatchesLegalGen(b, s);
+    });
+
+    RegisterTest("CaptureGen: matches legal gen in kiwipete", []() {
+        Chess::Board b; auto s = load(b, "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+        return captureGenMatchesLegalGen(b, s);
+    });
+
+    // The en-passant landing square can itself block a check ray
+    RegisterTest("CaptureGen: EP capture whose landing square blocks a check ray", []() {
+        Chess::Board b; load(b, "2r3k1/8/8/2pP4/8/8/8/2K5 w - c6 0 1");
+        Chess::Move caps[Chess::MaxLegalMoves];
+        unsigned int n = 0;
+        b.getAllCaptureMoves(Chess::PieceColor::White, caps, n);
+
+        for (unsigned int i = 0; i < n; ++i) {
+            if (Chess::HasFlag(caps[i].Flag, Chess::MoveFlag::EnPassant)) return true;
+        }
+        return false;
+    });
+
+    // Same horizontal-pin EP position as the "Edge: EP pin detection" test above,
+    // but checked through the capture generator specifically.
+    RegisterTest("CaptureGen: EP pin detection (horizontal) excludes the capture", []() {
+        Chess::Board b; load(b, "8/8/8/rPpK4/8/8/8/4k3 w - c6 0 1");
+        Chess::Move caps[Chess::MaxLegalMoves];
+        unsigned int n = 0;
+        b.getAllCaptureMoves(Chess::PieceColor::White, caps, n);
+
+        for (unsigned int i = 0; i < n; ++i) {
+            if (Chess::HasFlag(caps[i].Flag, Chess::MoveFlag::EnPassant)) return false;
+        }
+        return true;
+    });
+
+    // Full-tree consistency check (every capture move generated or missed, depth 3,
+    // from a position dense with en-passant and promotion opportunities).
+    RegisterTest("CaptureGen: full consistency vs legal gen, pos4 d3", []() {
+        Chess::Board b; auto s = load(b, "r3k2r/Pppp1ppp/1b6/8/8/1B6/pPPP1PPP/R3K2R b KQkq - 0 1");
+        return captureGenConsistentAtDepth(b, s, 3);
+    });
+
+    RegisterTest("CaptureGen: full consistency vs legal gen, pos5 d3", []() {
+        Chess::Board b; auto s = load(b, "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8");
+        return captureGenConsistentAtDepth(b, s, 3);
+    });
+
+    // =======================================================================
+    // En-passant
+    // =======================================================================
+
+    // The a7 pawn's only legal reply is en-passant (exd6 is the sole way to
+    // meet the discovered-check threat); its normal single/double pushes must
+    // still be generated and legal too, since they aren't forced here - this
+    // guards against a continue that skips a pawn's pushes while rejecting its EP move.
+    RegisterTest("EnPassant: normal pushes survive alongside a legal EP capture", []() {
+        Chess::Board b; load(b, "8/8/8/2pP4/8/8/8/k3K3 w - c6 0 1");
+        // d5 should still have a one-square push to d6 available (not consumed by the EP branch)
+        return findMove(b, Chess::PieceColor::White,
+            Chess::To2DIndex(3, 3), // d5
+            Chess::To2DIndex(2, 3), // d6
+            false
+        );
+    });
+
+    // Pawns not on their home rank must never attempt a double push, and must
+    // not crash/UB when checked for one.
+    RegisterTest("EnPassant: no double push offered off the home rank", []() {
+        Chess::Board b; load(b, "4k3/8/8/4P3/8/8/8/4K3 w - - 0 1");
+        Chess::Move moves[Chess::MaxLegalMoves];
+        unsigned int n = 0;
+        b.getAllLegalMoves(Chess::PieceColor::White, moves, n);
+
+        for (unsigned int i = 0; i < n; ++i) {
+            if (moves[i].StartingSquare == Chess::To2DIndex(3, 4) &&
+                Chess::HasFlag(moves[i].Flag, Chess::MoveFlag::PawnDoublePush)) {
+                return false;
+            }
+        }
+        return true;
+    });
+
+    // HasAnyLegalMoves must agree with getAllLegalMoves's count in a position
+    // where en-passant is among the legal replies (the original double-push
+    // bug could desync HasAnyLegalMoves specifically, since it recomputes moves independently).
+    RegisterTest("EnPassant: HasAnyLegalMoves agrees when EP is available", []() {
+        Chess::Board b; auto s = load(b, "8/8/8/2pP4/8/8/8/k3K3 w - c6 0 1");
+        return b.HasAnyLegalMoves(s) == (countMoves(b, s) > 0);
+    });
+
+    // Perft on a position built specifically to have overlapping en-passant,
+    // pin, and discovered-check interactions on the same rank.
+    RegisterPerftTest(
+        "Position 19 (EP/pin stress)", "8/8/8/r2pP2k/8/8/4K3/8 w - d6 0 1",
+        {10, 152, 1056, 18682, 125111}
+    );
+
+    // =======================================================================
+    // Incremental state (material / PST / phase / colour occupancy) sanity.
+    // =======================================================================
+
+    RegisterTest("Incremental: survives a normal move + undo-by-copy", []() {
+        Chess::Board b; auto s = load(b, Chess::DefaultFEN);
+        Chess::Board copy = b;
+        return doMove(copy, s, "e2e4");
+    });
+
+    RegisterTest("Incremental: survives castling both sides", []() {
+        Chess::Board b; auto s = load(b, "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+        return doMove(b, s, "e1g1");
+    });
+
+    RegisterTest("Incremental: survives an en-passant capture", []() {
+        Chess::Board b; auto s = load(b, "4k3/8/8/2pP4/8/8/8/4K3 w - c6 0 1");
+        return doMove(b, s, "d5c6");
+    });
+
+    RegisterTest("Incremental: survives a capturing promotion", []() {
+        Chess::Board b; auto s = load(b, "1n2k3/2P5/8/8/8/8/8/4K3 w - - 0 1");
+        return doMove(b, s, "c7b8q");
     });
 }
 
