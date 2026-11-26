@@ -3,6 +3,7 @@
 
 build/
 
+Settings.cfg
 *.pgn
 
 *.exe

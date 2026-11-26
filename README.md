@@ -109,31 +109,44 @@ All special moves are correctly flagged for search and evaluation purposes.
 
 # Graphical Interface
 
-The GUI is built using **SFML** and provides:
+The GUI is built using **SFML 3** and plays against the engine, or between two people on one screen. It is built separately from the UCI implementation (`make gui`) and only uses `src/Engine` and `src/GUI`.
 
+## Playing
+
+* **game modes:** play against the engine (as White or Black), or local play on one screen.
+* **custom starting positions:** type or paste a FEN when starting a game
 * drag-and-drop and click-based piece movement
 * legal move highlighting with capture indicators
-* smooth piece animations with piece tilting during drag
-* evaluation bar visualization with live updating
-* game over detection (checkmate, stalemate, draws) with particle effects
-* sound effects for moves, captures, checks, and special moves
-* board flipping and reset controls
-* **switchable themes** (Lichess, Chesscom) with distinct visual and behavioral differences
-* **arrow drawing** (right-click drag between squares, toggleable by redrawing)
-* **square markers** (right-click on square to toggle highlight)
-* promotion menu with piece selection
-* inspection mode for position analysis
-* configurable engine parameters (think time, search depth, opening book, pondering, catch-all mode)
-* FEN string copy and paste support (`Ctrl + C` / `Ctrl + V`)
-* tooltip hints on button hover
+* smooth piece animations
+* arrow drawing and square markers
+* move list in standard algebraic notation, with check and mate marks
+* **Best Move** plays the engine's best move for the side to move (turning into **Skip** while it thinks), **Hint** only draws it as an arrow
+* **Offer Draw** and **Resign**. The engine only accepts a draw when the position is about equal. In local play the offer appears as an Accept / Decline banner
+* game over detection (checkmate, stalemate, fifty-move rule, repetition, insufficient material, agreement, resignation) with a result card and particle effects
+* evaluation bar with live updating
+* inspection mode for position analysis, leaving it restores the game
+* board flipping
+* FEN copy and paste support (`Ctrl + C` / `Ctrl + V`)
+* sound effects for moves, captures, checks, promotions, castling, game start and game end
 
-This interface allows direct interaction with the engine without external tools.
+## Menu
 
-## Theme System
+Everything that isn't needed during a game lives in the menu (scrollable, tabbed):
+
+* **Game:** new game, copy FEN, switch the side to move
+* **Engine:** search by time or by depth, think time, search depth, evaluation depth, opening book, pondering, catch-all mode, hash size and thread count. Steppers repeat while held, and the think time step grows with the value
+* **Display:** board theme, piece set, evaluation bar, move list and coordinate labels
+* **Sound:** sound effects and volume
+
+Settings are saved to `Settings.cfg` and restored on the next launch.
+
+## Themes and pieces
 
 The engine features a **runtime-switchable theme system** that replicates the look and feel of popular chess platforms like `Lichess` and `Chesscom`.
 
-Themes control both visual appearance (colors, rendering styles) and behavioral differences (hover feedback, drag indicators), allowing faithful recreation of different platform experiences. The system is designed for easy extension - new themes can be added by inheriting from the `Theme` base class.
+Themes control both visual appearance (colors, rendering styles) and behavioral differences (hover feedback, drag indicators), allowing faithful recreation of different platform experiences. The interface follows the theme as well: neutral greys stay fixed, while buttons, toggles and highlights take the accent of the theme's dark squares. A new theme is a class that inherits from `Theme`, sets its own name in its constructor and is added to the list in `Themes.hpp`, whose order is the order in the menu.
+
+Piece sets are discovered at startup: drop a `.png` with the six pieces of both colors (one row per color) into `Resources/Textures/Pieces/` and it shows up in the menu, named after the file.
 
 ---
 
@@ -240,3 +253,7 @@ A standalone benchmark script (`benchmark.py`) plays two engine builds against e
 * statistical significance check to confirm whether one build is actually stronger, not just luckier
 
 Used to verify that engine changes are genuine improvements before merging them.
+
+## AI-Usage Note
+
+I only used AI to make the code platform independent, I don't have a unix system, so I implemented the windows part and asked claude to implement the unix counterpart with the same functionality.

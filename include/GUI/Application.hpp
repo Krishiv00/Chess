@@ -1,152 +1,165 @@
 #pragma once
 
-#include <vector>
 #include <filesystem>
-#include <thread>
 #include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include "SFML/Graphics.hpp"
 
 #include "Engine/Chess.hpp"
 
-#include "GUI/Themes.hpp"
-#include "GUI/Widgets.hpp"
+#include "GUI/Game/EngineRunner.hpp"
+#include "GUI/Game/Game.hpp"
+
+#include "GUI/BoardView.hpp"
+#include "GUI/Settings.hpp"
 #include "GUI/SoundSystem.hpp"
+#include "GUI/Themes.hpp"
+#include "GUI/UI/UI.hpp"
+#include "GUI/UI/Widgets.hpp"
+
+namespace Panel {
+    class PlayerCard;
+    class MoveList;
+}
+
+class PieceSets final {
+public:
+    struct Entry {
+        std::string Id;
+        std::string Name;
+        std::filesystem::path Path;
+    };
+
+private:
+    std::vector<Entry> m_Entries;
+    mutable std::vector<std::optional<sf::Texture>> m_Previews;
+    mutable std::vector<bool> m_PreviewTried;
+
+public:
+    void Scan(const std::filesystem::path& directory);
+
+    [[nodiscard]]
+    inline std::size_t Count() const noexcept {
+        return m_Entries.size();
+    }
+
+    [[nodiscard]]
+    inline const Entry& At(std::size_t index) const {
+        return m_Entries[index];
+    }
+
+    [[nodiscard]]
+    std::size_t IndexOf(const std::string& id) const;
+
+    [[nodiscard]]
+    const sf::Texture* Preview(std::size_t index) const;
+};
 
 class Application final {
 private:
-    enum class GameOverResult {
-        None,
-        Checkmate,
-        Stalemate,
-        DrawFiftyMove,
-        DrawRepetition,
-        DrawInsufficient
-    };
-
-    struct GameState {
-        std::string Fen{Chess::DefaultFEN};
-        Chess::Move LastMove;
-    };
+    [[nodiscard]]
+    Chess::PieceColor engineColor() const noexcept;
 
     [[nodiscard]]
-    inline bool hasSelectedPiece() const noexcept {
-        return m_SelectedPiece != Chess::NullPos;
-    }
+    Chess::PieceColor humanSide() const noexcept;
 
     [[nodiscard]]
-    inline int mapRank(int rank) const noexcept {
-        return m_Flipped ? (Chess::Ranks - 1 - rank) : rank;
-    }
+    bool humanCanMove() const noexcept;
 
-    [[nodiscard]]
-    inline int mapFile(int file) const noexcept {
-        return m_Flipped ? (Chess::Files - 1 - file) : file;
-    }
-
-    [[nodiscard]]
-    std::pair<int, int> mapMousePosToCoordinates(sf::Vector2i position) const noexcept {
-        return std::make_pair(
-            mapRank(position.y / m_SquareSize),
-            mapFile((position.x - m_EvaluationBarWidth) / m_SquareSize)
-        );
-    }
-
-    void joinThreads();
-
-    void startPonder();
-    void stopPonder();
-
-    void loadFen(const std::string& fen);
-
-    void doMove(Chess::Move move, bool animate);
-    void onMouseButtonSignal(sf::Vector2i position, bool released);
-    void pickPiece(int idx);
-    void dropPiece(int idx, bool animate = false, bool playIllegalSfx = true);
-
-    void commitPromotion(Chess::MoveFlag promotionFlag);
-    int hitTestPromotionMenu(sf::Vector2i mousePos) const;
-
-    void pollEngineMove(bool suggestOnly = false);
+    // Game flow
+    bool startNewGame(GameMode mode, bool playAsBlack, const std::string& fen, bool playSound = true);
+    void applyMove(Chess::Move move, bool animate);
+    void afterPositionChanged();
+    void startSearch(bool suggestion);
+    void playBestMove();
+    void toggleInspection();
+    void flipSideToMove();
+    void offerDraw();
+    void resign();
+    void concludeIfOver();
+    void endGame();
     void updateEvaluation();
+    void copyFen();
+    void loadFenFromClipboard();
+    void notify(std::string text);
 
-    [[nodiscard]]
-    std::vector<Arrow>::iterator findArrow(uint8_t start, uint8_t end);
+    // Settings
+    void applyEngineConfig();
+    void scheduleEngineConfig();
+    void applySound();
+    void setTheme(std::size_t index);
+    bool setPieceSet(std::size_t index);
+    void saveSettings() const;
 
-    void toggleArrow(uint8_t start, uint8_t end);
-    void addArrow(uint8_t start, uint8_t end);
+    // UI
+    void buildPanel();
+    void syncPanel();
+    void layout();
+    void reapDialogs();
+    void showDialog(std::unique_ptr<UI::Dialog> dialog);
+    void closeDialog();
+    void openMenu();
+    void openNewGame();
+    void openConfirm(std::string title, std::string text, std::string confirmLabel, std::function<void()> onConfirm);
 
-    void renderBoard(sf::RenderTarget& target) const;
-    void renderSquareHighlight(sf::RenderTarget& target, uint8_t square, sf::Color color) const;
-    void renderPiece(sf::RenderTarget& target, Chess::Piece piece, float x, float y, float angle = 0.f) const;
-    void renderPieces(sf::RenderTarget& target, bool mouseHeld) const;
-    void renderLegalMoves(sf::RenderTarget& target, sf::Vector2i mousePosition) const;
-    void renderPopup(sf::RenderTarget& target) const;
-    void renderCheckmateOverlay(sf::RenderTarget& target) const;
-    void renderPromotionMenu(sf::RenderTarget& target, sf::Vector2i mousePos) const;
-    void renderArrow(sf::RenderTarget& target, Arrow arrow) const;
+    Game m_Game;
+    EngineRunner m_Engine{m_Game.Board()};
 
-    Chess::Board m_Board;
-    Chess::Move m_LastMove;
-    Chess::PieceColor m_SideToMove;
-    Chess::PieceColor m_LastEngineColor;
+    GameMode m_Mode{GameMode::Local};
+    Chess::PieceColor m_PlayerColor{Chess::PieceColor::White};
+    Chess::PieceColor m_LastEngineColor{Chess::PieceColor::White};
 
-    uint16_t m_EngineThinkTimeMs{250};
-    uint8_t m_EvaluationDepth{12};
-    bool m_UseOwnBook{true};
-    bool m_Ponder{false};
-
-    // Invariant: only valid when not equal to `Chess::NullPos`
-    uint8_t m_SelectedPiece{Chess::NullPos};
-    std::vector<Chess::Move> m_LegalMovesForSelectedPiece;
-
-    float m_EvaluationBarWidth;
-    float m_SquareSize;
-    float m_PanelWidth;
-    float m_InspectionModeOverlay_t{0.f};
-    float m_DragTilt{0.f};
-
-    float m_GameOverTimer{0.f};
-    GameOverResult m_GameOverResult{GameOverResult::None};
-    ParticleSystem m_ParticleSystem;
-
-    float m_IllegalMoveTimer{0.f};
-    uint8_t m_IllegallyMovedPiece;
-
-    GameState m_InspectionEntryState;
-
-    sf::Vector2i m_LastMousePosition;
-
-    // Multithreading
-    std::thread m_SearchThread;
-    std::thread m_PonderThread;
-    Chess::Move m_PendingEngineMove;
-
-    // Game state
-    bool m_GameOver{false};
-    bool m_Flipped{false};
-    bool m_PromotionSelectionActive{false};
-    bool m_EngineThinking{false};
-    bool m_InspectionMode{false};
-    bool m_SuggestingMove{false};
-
-    // UI / UX
-    std::size_t m_CurrentThemeIdx{0};
-    std::unique_ptr<Themes::Theme> m_Theme{Themes::Factories[m_CurrentThemeIdx]()};
-    std::vector<PieceMoveAnim> m_PieceAnimations;
-    std::vector<Arrow> m_Arrows;
-    Popup m_Popup;
-    EvaluationBar m_EvaluationBar;
-    ButtonPanel m_ButtonPanel;
-    uint64_t m_Markers{0ull};
-    Arrow m_CurrentlyDrawingArrow;
+    Settings m_Settings;
+    std::filesystem::path m_SettingsPath;
+    bool m_ConfigDirty{false};
+    float m_ConfigTimer{0.f};
 
     // Resources
-    sf::Texture m_PieceTexture;
-    sf::Texture m_IconTexture;
     sf::Font m_Font;
+    sf::Texture m_IconTexture;
+    sf::Texture m_PieceTexture;
+    PieceSets m_PieceSets;
+    SfxPlayer m_Sfx;
 
-    SfxPlayer m_SfxPlayer;
+    // Look
+    std::size_t m_ThemeIdx{0};
+    std::size_t m_PieceIdx{0};
+    std::unique_ptr<Themes::Theme> m_Theme;
+    UI::Context m_Ctx;
+
+    // Layout and widgets
+    sf::Vector2u m_WindowSize;
+    sf::FloatRect m_EvalBarRect;
+    sf::FloatRect m_PanelRect;
+
+    BoardView m_BoardView{m_Game, m_PieceTexture};
+    EvaluationBar m_EvalBar;
+
+    std::unique_ptr<UI::Column> m_Panel;
+    Panel::PlayerCard* m_TopCard{nullptr};
+    Panel::PlayerCard* m_BottomCard{nullptr};
+    Panel::MoveList* m_MoveList{nullptr};
+    UI::Label* m_BannerText{nullptr};
+    UI::Button* m_HintButton{nullptr};
+    UI::Button* m_PlayButton{nullptr};
+    UI::Button* m_InspectButton{nullptr};
+    UI::Button* m_DrawButton{nullptr};
+    UI::Button* m_ResignButton{nullptr};
+
+    std::unique_ptr<UI::Dialog> m_Dialog;
+    std::unique_ptr<UI::Dialog> m_NextDialog;
+
+    std::string m_Message;
+    float m_MessageTimer{0.f};
+
+    float m_DrawOfferTimer{0.f};
+
+    // what the new game dialog shows, lives as long as the app does
+    GameMode m_NewGameMode{GameMode::Local};
+    bool m_NewGameBlack{false};
 
 public:
     Application();
@@ -154,15 +167,20 @@ public:
 
     void SetTargetSize(sf::Vector2u size);
 
+    void SetWindowState(sf::Vector2u restoredSize, bool maximized);
+
     [[nodiscard]]
     bool LoadResources(const std::filesystem::path& root);
 
-    void Update(float deltaTime);
+    void Update(float deltaTime, sf::Vector2i mousePosition);
     void Render(sf::RenderTarget& target, sf::Vector2i mousePosition) const;
 
-    void HandleKeyPressed(sf::Keyboard::Scancode key);
+    [[nodiscard]]
+    bool HandleKeyPressed(sf::Keyboard::Scancode key, bool control);
+
+    void HandleTextEntered(char32_t unicode);
     void HandleMouseButtonPressed(sf::Mouse::Button button, sf::Vector2i position);
     void HandleMouseButtonReleased(sf::Mouse::Button button, sf::Vector2i position);
     void HandleMouseMoved(sf::Vector2i position);
-    void HandleMouseLeftWindow();
+    void HandleMouseWheel(sf::Vector2i position, float delta);
 };

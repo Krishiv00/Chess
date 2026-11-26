@@ -7,6 +7,8 @@
 #include <string>
 
 namespace Chess {
+    constexpr inline const char* EngineName = "Chess++";
+
     constexpr inline const int Ranks = 8;
     constexpr inline const int Files = 8;
 

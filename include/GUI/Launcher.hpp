@@ -9,24 +9,25 @@
 class Launcher final {
 public:
     struct Config {
-        unsigned int WindowSize;
-        float AspectRatio;
+        unsigned int WindowSize; // default window height, the width follows from it
         unsigned int Fps;
         const char* WindowTitle;
         unsigned int WindowStyle;
     };
 
 private:
-    void onResize();
-    void handleWindowResize(sf::Vector2u size);
+    void onResized(sf::Vector2u size);
+    void commitWindowState();
     void onEvent(const sf::Event& event);
 
     mutable sf::RenderWindow m_Window;
-    sf::Vector2u m_LastWindowSize;
 
     sf::Clock m_Clock;
 
     Application m_Application;
+
+    sf::Vector2u m_RestoredSize;
+    float m_StateTimer{0.f};
 
 public:
     Launcher(const Config& config);

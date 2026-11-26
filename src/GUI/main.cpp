@@ -2,8 +2,7 @@
 
 int main() {
     Launcher launcher({
-        .WindowSize = 850u,
-        .AspectRatio = 1.125f,
+        .WindowSize = 800u,
         .Fps = 60u,
         .WindowTitle = "Chess",
         .WindowStyle = sf::Style::Default
