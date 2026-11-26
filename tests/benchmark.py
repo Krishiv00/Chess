@@ -13,6 +13,7 @@ from typing import Optional, Literal
 
 import chess
 import chess.engine
+import chess.pgn
 from rich.align import Align
 from rich.console import Console, Group
 from rich.live import Live
@@ -21,11 +22,16 @@ from rich.table import Table
 from rich.text import Text
 
 
-ENGINE_A_PATH = "new"
+ENGINE_A_PATH = input("Engine A: ") or "new"
 ENGINE_A_NAME = "Engine A"
 
-ENGINE_B_PATH = "old"
+ENGINE_B_PATH = input("Engine B: ") or "old"
 ENGINE_B_NAME = "Engine B"
+
+PGN_PATH = "games.pgn"
+
+PGN_MIN_PLY = 8
+PGN_MAX_PLY = 60
 
 GAME_PAIRS = 100 # total games played = GAME_PAIRS * 2
 
@@ -35,13 +41,13 @@ MOVETIME_MS = 50 # ms
 DEPTH = None
 
 ENGINE_OPTIONS = {
-    "Hash": "32",
+    "Hash": "64",
     "Threads": "1",
-    "OwnBook": "true",
+    "OwnBook": "false",
 }
 
 MAX_MOVES = 200
-SHOW_BOARD = True # render board in TUI
+SHOW_BOARD = False # render board in TUI
 CONFIDENCE = 0.95
 
 SEARCH_MIN_NODES = 1000
@@ -98,6 +104,7 @@ def compute_elo(wins: int, losses: int, draws: int, confidence: float) -> EloEst
 @dataclass
 class MoveSearchSample:
     depth: int
+    time_ms: int
     nodes: int
     nps: float
     ebf: float # effective branching factor: nodes ** (1/depth)
@@ -106,13 +113,17 @@ class MoveSearchSample:
 def sample_from_info(info: dict) -> Optional["MoveSearchSample"]:
     depth = info.get("depth")
     nodes = info.get("nodes")
+
     if not depth or not nodes or depth < SEARCH_MIN_DEPTH or nodes < SEARCH_MIN_NODES:
         return None
 
     time_s = info.get("time") or 0
+    time_ms = time_s * 1000
+
     nps = info.get("nps") or (nodes / time_s if time_s > 0 else 0)
     ebf = nodes ** (1.0 / depth)
-    return MoveSearchSample(depth=depth, nodes=nodes, nps=nps, ebf=ebf)
+
+    return MoveSearchSample(depth=depth, time_ms=time_ms, nodes=nodes, nps=nps, ebf=ebf)
 
 
 @dataclass
@@ -123,6 +134,9 @@ class SearchEfficiencyEstimate:
     depth_diff: float
     depth_margin: float
     depth_conf: float
+    time_a: float
+    time_b: float
+    time_pct_diff: float
     ebf_a: float
     ebf_b: float
     ebf_pct_diff: float # negative = A prunes more (fewer nodes/ply) than B
@@ -164,12 +178,18 @@ def compute_search_efficiency(pair_diffs: dict, confidence: float) -> SearchEffi
 
     depth_a = sum(pair_diffs["depth_a"]) / n_pairs if n_pairs else 0.0
     depth_b = sum(pair_diffs["depth_b"]) / n_pairs if n_pairs else 0.0
+
+    time_a = sum(pair_diffs["time_a"]) / n_pairs if n_pairs else 0.0
+    time_b = sum(pair_diffs["time_b"]) / n_pairs if n_pairs else 0.0
+
     ebf_a = sum(pair_diffs["ebf_a"]) / n_pairs if n_pairs else 0.0
     ebf_b = sum(pair_diffs["ebf_b"]) / n_pairs if n_pairs else 0.0
+
     nps_a = sum(pair_diffs["nps_a"]) / n_pairs if n_pairs else 0.0
     nps_b = sum(pair_diffs["nps_b"]) / n_pairs if n_pairs else 0.0
 
     # log-ratio -> percent difference
+    time_pct_diff = ((time_a - time_b) / time_b * 100 if time_b else 0.0)
     ebf_pct_diff = (math.exp(ebf_log_diff) - 1) * 100
     ebf_pct_margin = (math.exp(ebf_log_diff + ebf_log_margin) - math.exp(ebf_log_diff)) * 100
     nps_pct_diff = ((nps_a - nps_b) / nps_b * 100) if nps_b else 0.0
@@ -178,6 +198,9 @@ def compute_search_efficiency(pair_diffs: dict, confidence: float) -> SearchEffi
         n_pairs=n_pairs,
         depth_a=depth_a, depth_b=depth_b,
         depth_diff=depth_diff, depth_margin=depth_margin, depth_conf=depth_conf,
+        time_a=time_a,
+        time_b=time_b,
+        time_pct_diff=time_pct_diff,
         ebf_a=ebf_a, ebf_b=ebf_b,
         ebf_pct_diff=ebf_pct_diff, ebf_pct_margin=ebf_pct_margin, ebf_conf=ebf_conf,
         nps_a=nps_a, nps_b=nps_b, nps_pct_diff=nps_pct_diff,
@@ -205,9 +228,11 @@ class GameOutcome:
 
 
 def make_limit() -> chess.engine.Limit:
-    if MOVETIME_MS is not None:
-        return chess.engine.Limit(time=MOVETIME_MS / 1000.0)
-    return chess.engine.Limit(depth=DEPTH or 12)
+    if DEPTH is not None:
+        return chess.engine.Limit(depth=DEPTH)
+    if MOVETIME_MS is None:
+        raise RuntimeError("MoveTimeMs is missing")
+    return chess.engine.Limit(time=MOVETIME_MS / 1000.0)
 
 
 def start_engine(path: str) -> chess.engine.SimpleEngine:
@@ -309,6 +334,7 @@ class SearchStats:
         self.pair_diffs: dict = {
             "depth": [], "ebf_log_ratio": [],
             "depth_a": [], "depth_b": [], "ebf_a": [], "ebf_b": [],
+            "time_a": [], "time_b": [],
             "nps_a": [], "nps_b": [],
         }
 
@@ -328,17 +354,27 @@ class SearchStats:
 
         depth_a = sum(s.depth for s in a_samples) / len(a_samples)
         depth_b = sum(s.depth for s in b_samples) / len(b_samples)
+
+        time_a = sum(s.time_ms for s in a_samples) / len(a_samples)
+        time_b = sum(s.time_ms for s in b_samples) / len(b_samples)
+
         ebf_a = math.exp(sum(math.log(s.ebf) for s in a_samples) / len(a_samples))
         ebf_b = math.exp(sum(math.log(s.ebf) for s in b_samples) / len(b_samples))
+
         nps_a = sum(s.nps for s in a_samples) / len(a_samples)
         nps_b = sum(s.nps for s in b_samples) / len(b_samples)
 
         self.pair_diffs["depth"].append(depth_a - depth_b)
-        self.pair_diffs["ebf_log_ratio"].append(math.log(ebf_a) - math.log(ebf_b))
         self.pair_diffs["depth_a"].append(depth_a)
         self.pair_diffs["depth_b"].append(depth_b)
+
+        self.pair_diffs["time_a"].append(time_a)
+        self.pair_diffs["time_b"].append(time_b)
+
+        self.pair_diffs["ebf_log_ratio"].append(math.log(ebf_a) - math.log(ebf_b))
         self.pair_diffs["ebf_a"].append(ebf_a)
         self.pair_diffs["ebf_b"].append(ebf_b)
+
         self.pair_diffs["nps_a"].append(nps_a)
         self.pair_diffs["nps_b"].append(nps_b)
 
@@ -414,6 +450,7 @@ def search_panel(est: SearchEfficiencyEstimate, name_a: str, name_b: str) -> Pan
         )
 
     depth_color = "green" if est.depth_diff > 0 else ("red" if est.depth_diff < 0 else "white")
+    time_color = ("green" if est.time_pct_diff < 0 else ("red" if est.time_pct_diff > 0 else "white"))
     # negative ebf_pct_diff = A needs fewer nodes/ply than B = A prunes harder
     ebf_color = "green" if est.ebf_pct_diff < 0 else ("red" if est.ebf_pct_diff > 0 else "white")
     nps_color = "green" if est.nps_pct_diff > 0 else ("red" if est.nps_pct_diff < 0 else "white")
@@ -427,6 +464,11 @@ def search_panel(est: SearchEfficiencyEstimate, name_a: str, name_b: str) -> Pan
         "Depth",
         f"{name_a} {est.depth_a:.1f}  vs  {name_b} {est.depth_b:.1f}",
         Text(f"{est.depth_diff:+.2f} ±{est.depth_margin:.2f} ({est.depth_conf*100:.0f}%)", style=depth_color),
+    )
+    table.add_row(
+        "Time",
+        f"{name_a} {est.time_a:.2f} ms  vs  {name_b} {est.time_b:.2f} ms",
+        Text(f"{est.time_pct_diff:+.1f}%", style=time_color),
     )
     table.add_row(
         "EBF",
@@ -556,6 +598,34 @@ class Dashboard:
             self.live.update(self.render())
 
 
+def load_pgn_positions(path: str) -> list[chess.Board]:
+    positions = []
+
+    if not os.path.exists(path):
+        return positions
+
+    with open(path, encoding="utf-8-sig") as file:
+        while game := chess.pgn.read_game(file):
+            if game.errors:
+                continue
+
+            board = game.board()
+
+            for ply, move in enumerate(game.mainline_moves(), start=1):
+                board.push(move)
+
+                if not (PGN_MIN_PLY <= ply <= PGN_MAX_PLY):
+                    continue
+
+                if board.is_valid() and not board.is_game_over(claim_draw=True):
+                    positions.append(board.copy(stack=False))
+
+                    if len(positions) >= GAME_PAIRS:
+                        return positions
+
+    return positions
+
+
 def run_worker(worker_id: int, work_q: "queue.Queue", stats: MatchStats, search_stats: SearchStats, dashboard: Dashboard):
     engine_a = start_engine(ENGINE_A_PATH)
     engine_b = start_engine(ENGINE_B_PATH)
@@ -599,8 +669,10 @@ def main() -> None:
     dashboard = Dashboard(stats, search_stats, total_games)
 
     work_q: "queue.Queue" = queue.Queue()
-    for pair_index in range(GAME_PAIRS):
-        work_q.put((pair_index, chess.Board()))
+    positions = [] if PGN_PATH is None else load_pgn_positions(PGN_PATH)
+    for i in range(GAME_PAIRS):
+        start_board = positions[i] if len(positions) > i else chess.Board()
+        work_q.put((i, start_board))
 
     workers = max(1, min(concurrency, GAME_PAIRS))
 
