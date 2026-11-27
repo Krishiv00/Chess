@@ -22,19 +22,26 @@ ENGINE_SRC := $(call rwildcard,$(SRC_DIR)/Engine,*.cpp)
 GUI_SRC := $(call rwildcard,$(SRC_DIR)/GUI,*.cpp)
 UCI_SRC := $(call rwildcard,$(SRC_DIR)/UCI,*.cpp)
 
-GUI_DEV_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/%.o,$(GUI_SRC)) $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/GUI/%.o,$(ENGINE_SRC))
-GUI_REL_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/%.o,$(GUI_SRC)) $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/GUI/%.o,$(ENGINE_SRC))
-UCI_DEV_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/%.o,$(UCI_SRC)) $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/UCI/%.o,$(ENGINE_SRC))
-UCI_REL_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/%.o,$(UCI_SRC)) $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/UCI/%.o,$(ENGINE_SRC))
+ENGINE_DEV_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/%.o,$(ENGINE_SRC))
+ENGINE_REL_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/%.o,$(ENGINE_SRC))
+
+GUI_DEV_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/%.o,$(GUI_SRC)) $(ENGINE_DEV_OBJ)
+GUI_REL_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/%.o,$(GUI_SRC)) $(ENGINE_REL_OBJ)
+UCI_DEV_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/%.o,$(UCI_SRC)) $(ENGINE_DEV_OBJ)
+UCI_REL_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/%.o,$(UCI_SRC)) $(ENGINE_REL_OBJ)
 
 UCI_INC := -I$(INCLUDE_DIR) -I$(INCLUDE_DIR)/Engine -I$(INCLUDE_DIR)/UCI
 GUI_INC := -I$(INCLUDE_DIR) -I$(INCLUDE_DIR)/Engine -I$(INCLUDE_DIR)/GUI -I$(SFML_INCLUDE)
+ENGINE_INC := -I$(INCLUDE_DIR) -I$(INCLUDE_DIR)/Engine
 
 UCI_DEV_FLAGS := $(STD) $(UCI_INC) -fno-exceptions -Os -pipe -MMD -MP
 UCI_REL_FLAGS := $(STD) $(UCI_INC) -fno-exceptions -O3 -DNDEBUG -ffunction-sections -fdata-sections
 
 GUI_DEV_FLAGS := $(STD) $(GUI_INC) -fno-exceptions -Os -pipe -MMD -MP -DSFML_DYNAMIC
 GUI_REL_FLAGS := $(STD) $(GUI_INC) -fno-exceptions -O3 -DNDEBUG -DSFML_STATIC -ffunction-sections -fdata-sections -fmerge-all-constants
+
+ENGINE_DEV_FLAGS := $(STD) $(ENGINE_INC) -fno-exceptions -Os -pipe -MMD -MP
+ENGINE_REL_FLAGS := $(STD) $(ENGINE_INC) -fno-exceptions -O3 -DNDEBUG -ffunction-sections -fdata-sections
 
 GUI_DEV_LIBS := -L$(SFML_LIB) -lsfml-graphics -lsfml-window -lsfml-audio -lsfml-network -lsfml-system
 GUI_REL_LIBS := -L$(SFML_LIB) -lsfml-graphics-s -lsfml-window-s -lsfml-audio-s -lsfml-network-s -lsfml-system-s -lfreetype -lharfbuzz -lmbedtls -lmbedx509 -lmbedcrypto -lopengl32 -lgdi32 -lwinmm -lws2_32 -ldnsapi -lflac -lvorbisenc -lvorbisfile -lvorbis -logg -lpthread -lbcrypt -lcrypt32
@@ -91,25 +98,15 @@ $(BUILD_DIR)/release/UCI/%.o: $(SRC_DIR)/UCI/%.cpp FORCE
 	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))"
 	@$(CXX) $(UCI_REL_FLAGS) -c $< -o $@
 
-$(BUILD_DIR)/dev/GUI/Engine/%.o: $(SRC_DIR)/Engine/%.cpp Makefile
+$(BUILD_DIR)/dev/Engine/%.o: $(SRC_DIR)/Engine/%.cpp Makefile
 	@echo Compiling $<
 	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))"
-	@$(CXX) $(GUI_DEV_FLAGS) -c $< -o $@
+	@$(CXX) $(ENGINE_DEV_FLAGS) -c $< -o $@
 
-$(BUILD_DIR)/release/GUI/Engine/%.o: $(SRC_DIR)/Engine/%.cpp FORCE
+$(BUILD_DIR)/release/Engine/%.o: $(SRC_DIR)/Engine/%.cpp FORCE
 	@echo Compiling $<
 	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))"
-	@$(CXX) $(GUI_REL_FLAGS) -c $< -o $@
-
-$(BUILD_DIR)/dev/UCI/Engine/%.o: $(SRC_DIR)/Engine/%.cpp Makefile
-	@echo Compiling $<
-	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))"
-	@$(CXX) $(UCI_DEV_FLAGS) -c $< -o $@
-
-$(BUILD_DIR)/release/UCI/Engine/%.o: $(SRC_DIR)/Engine/%.cpp FORCE
-	@echo Compiling $<
-	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))"
-	@$(CXX) $(UCI_REL_FLAGS) -c $< -o $@
+	@$(CXX) $(ENGINE_REL_FLAGS) -c $< -o $@
 
 ifneq ($(wildcard $(ICON_FILE)),)
 $(RES_OBJ): $(ICON_FILE)
@@ -131,4 +128,4 @@ clean:
 	@if exist "$(BUILD_DIR)" rmdir /S /Q "$(BUILD_DIR)"
 	@if exist "$(OUT_DIR)" rmdir /S /Q "$(OUT_DIR)"
 
--include $(GUI_DEV_OBJ:.o=.d) $(UCI_DEV_OBJ:.o=.d)
+-include $(GUI_DEV_OBJ:.o=.d) $(UCI_DEV_OBJ:.o=.d) $(GUI_REL_OBJ:.o=.d) $(UCI_REL_OBJ:.o=.d)
