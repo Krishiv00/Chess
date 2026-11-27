@@ -36,6 +36,7 @@ namespace {
         visit("ShowCoordinates", s.ShowCoordinates);
         visit("SoundEnabled", s.SoundEnabled);
         visit("Volume", s.Volume);
+        visit("PlayerName", s.PlayerName);
         visit("WindowWidth", s.WindowWidth);
         visit("WindowHeight", s.WindowHeight);
         visit("WindowMaximized", s.WindowMaximized);
@@ -108,6 +109,13 @@ void Settings::clamp() {
 
     HashMB = std::clamp(HashMB, 1, static_cast<int>(Platform::MaxHashMB()));
     Threads = std::clamp(Threads, 1, static_cast<int>(Platform::TotalThreads()));
+
+    const auto printable = [](std::string& text, std::size_t maxLength) {
+        text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char c) { return c < 32 || c > 126; }), text.end());
+        if (text.size() > maxLength) text.resize(maxLength);
+    };
+
+    printable(PlayerName, 20);
 
     WindowWidth = std::max(0, WindowWidth);
     WindowHeight = std::max(0, WindowHeight);

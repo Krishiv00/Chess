@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <iostream>
 
@@ -11,8 +12,6 @@
 #pragma region Piece sets
 
 namespace {
-    constexpr float MessageDuration = 3.f;
-
     // unanswered draw offers lapse after this long
     constexpr float DrawOfferDuration = 10.f;
 
@@ -48,6 +47,7 @@ namespace {
         case GameResult::DrawInsufficient: return {"DRAW", "Insufficient material."};
         case GameResult::DrawAgreement: return {"DRAW", "Agreed by both players."};
         case GameResult::Resignation: return {"RESIGNED", loser + " resigned. " + winner + " wins."};
+        case GameResult::Abandoned: return {"OPPONENT LEFT", loser + " disconnected. " + winner + " wins."};
         default: return {};
         }
     }
@@ -351,7 +351,7 @@ bool Application::LoadResources(const std::filesystem::path& root) {
         {Sfx::Capture, "Capture.wav"}, {Sfx::Check, "Check.wav"}, {Sfx::GameEnd, "Game End.wav"},
         {Sfx::MoveSelf, "Move Self.wav"}, {Sfx::MoveOpponent, "Move Opp.wav"}, {Sfx::Promotion, "Promotion.wav"},
         {Sfx::Notify, "Notify.wav"}, {Sfx::Illegal, "Illegal.wav"}, {Sfx::SpecialMove, "Special Move.wav"}, {Sfx::GameStart, "Game Start.wav"}
-    }};
+        }};
 
     for (const auto& [sfx, file] : Sounds) {
         if (!m_Sfx.LoadFromFile(sfx, soundPath / file)) [[unlikely]] {
@@ -366,7 +366,12 @@ bool Application::LoadResources(const std::filesystem::path& root) {
     setTheme(Themes::IndexOf(m_Settings.Theme));
     applySound();
 
-    m_BoardView.OnMove = [this](Chess::Move move, bool animate) { applyMove(move, animate); };
+    m_BoardView.OnMove = [this](Chess::Move move, bool animate) {
+        applyMove(move, animate);
+
+        // moves made while inspecting are only for looking around
+        if (online() && !m_Game.Inspecting()) m_Net.Send(Net::EventType::Move, Chess::MoveToUCI(move));
+        };
     m_BoardView.OnIllegalMove = [this]() { m_Sfx.Play(Sfx::Illegal); };
     m_BoardView.OnPromotionPrompt = [this]() { m_Sfx.Play(Sfx::Notify); };
 
@@ -399,7 +404,7 @@ void Application::layout() {
 
     m_Ctx.Scale = height / 800.f;
 
-    const float evalWidth = m_Settings.ShowEvalBar ? height * 0.03f : 0.f;
+    const float evalWidth = evalBarVisible() ? height * 0.03f : 0.f;
 
     m_EvalBarRect = sf::FloatRect({0.f, 0.f}, {evalWidth, height});
     m_BoardView.SetGeometry({evalWidth, 0.f}, height / Chess::Ranks);
@@ -468,13 +473,19 @@ Chess::PieceColor Application::engineColor() const noexcept {
 }
 
 Chess::PieceColor Application::humanSide() const noexcept {
-    return m_Mode == GameMode::Engine ? m_PlayerColor : m_Game.SideToMove();
+    return m_Mode == GameMode::Local ? m_Game.SideToMove() : m_PlayerColor;
 }
 
 bool Application::humanCanMove() const noexcept {
     if (m_Game.Over() || m_Engine.Thinking() || m_Dialog) return false;
 
+    if (online()) return m_Game.Inspecting() || (m_Net.Connected() && m_Game.SideToMove() == m_PlayerColor);
+
     return m_Game.Inspecting() || m_Mode != GameMode::Engine || m_Game.SideToMove() == m_PlayerColor;
+}
+
+bool Application::evalBarVisible() const noexcept {
+    return m_Settings.ShowEvalBar && (!online() || m_NetEval);
 }
 
 bool Application::startNewGame(GameMode mode, bool playAsBlack, const std::string& fen, bool playSound) {
@@ -482,14 +493,18 @@ bool Application::startNewGame(GameMode mode, bool playAsBlack, const std::strin
 
     if (!Fen::Parse(position)) return false;
 
+    if (mode != GameMode::Online) m_Net.Close();
+
     m_Engine.Reset();
     (void)m_Game.Reset(position);
 
+    m_Rematch = Rematch::None;
     m_Mode = mode;
     m_PlayerColor = playAsBlack ? Chess::PieceColor::Black : Chess::PieceColor::White;
 
     m_BoardView.NewGame();
-    m_BoardView.SetFlipped(mode == GameMode::Engine && playAsBlack);
+    m_BoardView.SetFlipped(mode != GameMode::Local && playAsBlack);
+    layout();
 
     if (playSound) m_Sfx.Play(Sfx::GameStart);
 
@@ -534,7 +549,7 @@ void Application::afterPositionChanged() {
 }
 
 void Application::startSearch(bool suggestion) {
-    if (m_Game.Over() || m_Engine.Thinking()) return;
+    if (m_Game.Over() || m_Engine.Thinking() || online()) return;
 
     // the hash is about to be touched
     m_Engine.StopPonder();
@@ -579,6 +594,11 @@ void Application::toggleInspection() {
 }
 
 void Application::flipSideToMove() {
+    if (online()) {
+        notify("Not available in online games");
+        return;
+    }
+
     m_Engine.Reset();
     m_Game.FlipSideToMove();
     m_BoardView.NewGame();
@@ -593,7 +613,11 @@ void Application::offerDraw() {
 
     if (m_Mode != GameMode::Engine) {
         m_Game.OfferDraw(humanSide());
-        m_DrawOfferTimer = DrawOfferDuration;
+
+        // small buffer to counter the lag
+        m_DrawOfferTimer = DrawOfferDuration + (online() ? 2.f : 0.f);
+
+        if (online()) m_Net.Send(Net::EventType::DrawOffer);
         return;
     }
 
@@ -610,10 +634,15 @@ void Application::offerDraw() {
 }
 
 void Application::resign() {
-    const std::string text = m_Mode == GameMode::Engine ? "You will lose this game." : std::string(ColorName(humanSide())) + " will lose this game.";
+    const std::string text = m_Mode == GameMode::Local ? std::string(ColorName(humanSide())) + " will lose this game." : "You will lose this game.";
 
     openConfirm("Resign?", text, "Resign", [this]() {
+        if (m_Game.Over()) return;
+
         m_Game.Resign(humanSide());
+
+        if (online()) m_Net.Send(Net::EventType::Resign);
+
         endGame();
     });
 }
@@ -656,15 +685,278 @@ void Application::copyFen() {
     notify("FEN copied");
 }
 
-void Application::loadFenFromClipboard() {
-    const std::string text = sf::Clipboard::getString().toAnsiString();
-
-    if (!startNewGame(m_Mode, m_PlayerColor == Chess::PieceColor::Black, text)) notify("Clipboard doesn't hold a valid FEN");
+void Application::notify(std::string text, float seconds) {
+    m_Message = std::move(text);
+    m_MessageTimer = seconds;
 }
 
-void Application::notify(std::string text) {
-    m_Message = std::move(text);
-    m_MessageTimer = MessageDuration;
+#pragma region Online
+
+Net::Session::Config Application::netConfig() const {
+    return {m_Settings.PlayerName.empty() ? "Player" : m_Settings.PlayerName, Net::RelayUrl};
+}
+
+void Application::startHosting(bool playAsBlack, const std::string& fen, bool evalBar) {
+    const std::optional<Fen::Parsed> parsed = Fen::Parse(fen.empty() ? std::string(Chess::DefaultFEN) : fen);
+
+    m_NetHost = true;
+    m_NetHostBlack = playAsBlack;
+    m_NetEval = evalBar;
+    m_NetBegun = false;
+    m_NetFen = parsed ? parsed->Text : std::string(Chess::DefaultFEN);
+
+    m_Net.Host(Net::GenerateCode(), netConfig());
+
+    openOnlineWait();
+}
+
+void Application::startJoining(const std::string& code) {
+    m_NetHost = false;
+    m_NetBegun = false;
+    m_JoinCode = code;
+
+    m_Net.Join(code, netConfig());
+
+    openOnlineWait();
+}
+
+bool Application::beginOnlineGame(bool playAsBlack, const std::string& fen) {
+    m_NetBegun = true;
+
+    if (m_WaitDialog && m_Dialog.get() == m_WaitDialog) closeDialog();
+
+    const std::string unplayable = "That starting position can't be played, the online game was cancelled.";
+
+    if (!Fen::Plausible(fen)) {
+        dropOnline(unplayable);
+        return false;
+    }
+
+    (void)startNewGame(GameMode::Online, playAsBlack, fen);
+
+    if (m_Game.Board().isUnderCheck(Chess::InvertColor(m_Game.SideToMove()))) {
+        (void)startNewGame(GameMode::Local, false, "", false);
+        notify(unplayable, 10.f);
+        return false;
+    }
+
+    m_Net.SetResumable(true);
+
+    return true;
+}
+
+void Application::leaveInspection() {
+    if (!m_Game.Inspecting()) return;
+
+    m_Game.EndInspection();
+    m_BoardView.NewGame();
+
+    updateEvaluation();
+}
+
+void Application::offerRematch() {
+    if (!online() || !m_Net.Connected() || !m_Game.Over() || m_Rematch != Rematch::None) return;
+
+    m_Rematch = Rematch::Sent;
+
+    // small buffer like draw offer
+    m_RematchTimer = DrawOfferDuration + 2.f;
+
+    m_Net.Send(Net::EventType::RematchOffer);
+}
+
+void Application::answerRematch(bool accept) {
+    if (m_Rematch != Rematch::Received) return;
+
+    m_Net.Send(accept ? Net::EventType::RematchAccept : Net::EventType::RematchDecline);
+    m_Rematch = Rematch::None;
+
+    if (accept) restartOnline();
+    else notify("Rematch declined");
+}
+
+void Application::restartOnline() {
+    if (!m_NetHost) return;
+
+    m_NetHostBlack = !m_NetHostBlack;
+
+    if (beginOnlineGame(m_NetHostBlack, m_NetFen)) m_Net.Send(Net::EventType::Start, m_NetFen, !m_NetHostBlack, m_NetEval);
+}
+
+void Application::pumpNetwork(float deltaTime) {
+    m_Net.Update(deltaTime);
+
+    while (const std::optional<Net::Event> event = m_Net.Poll()) handleNetEvent(*event);
+
+    if (m_WaitDialog && m_WaitStatus) {
+        const bool failed = m_Net.GetState() == Net::Session::State::Closed;
+
+        if (m_WaitCode) m_WaitCode->SetText(Net::FormatCode(m_Net.Code()));
+
+        m_WaitStatus->SetText(m_Net.Status());
+        m_WaitStatus->SetTone(failed ? UI::Tone::Danger : UI::Tone::Normal);
+        m_WaitInfo->SetText(m_Net.RelayInfo());
+    }
+}
+
+void Application::handleNetEvent(const Net::Event& event) {
+    if (m_NetBegun && online() && (event.Type == Net::EventType::Move || event.Type == Net::EventType::Resign ||
+        event.Type == Net::EventType::DrawOffer || event.Type == Net::EventType::DrawAccept ||
+        event.Type == Net::EventType::Resumed || event.Type == Net::EventType::Sync)) {
+        leaveInspection();
+    }
+
+    switch (event.Type) {
+    case Net::EventType::Connected:
+        if (m_NetHost && beginOnlineGame(m_NetHostBlack, m_NetFen)) m_Net.Send(Net::EventType::Start, m_NetFen, !m_NetHostBlack, m_NetEval);
+        break;
+
+    case Net::EventType::Start:
+        if (!m_NetHost && (!m_NetBegun || m_Game.Over())) {
+            m_NetEval = event.Option;
+            (void)beginOnlineGame(event.Flag, event.Text);
+        }
+        break;
+
+    case Net::EventType::Closed:
+        m_Rematch = Rematch::None;
+
+        if (m_NetBegun && online() && !m_Game.Over()) forfeitOpponent(event.Text);
+        break;
+
+    case Net::EventType::Reconnecting:
+        break;
+
+    case Net::EventType::Resumed:
+        if (!m_NetBegun || !online()) break;
+
+        notify("Reconnected");
+
+        m_Net.Send(Net::EventType::Sync, std::to_string(m_Game.History().size()));
+        break;
+
+    case Net::EventType::Sync: {
+        if (!m_NetBegun || !online()) break;
+
+        const std::size_t mine = m_Game.History().size();
+        std::size_t theirs = 0;
+        (void)std::from_chars(event.Text.data(), event.Text.data() + event.Text.size(), theirs);
+
+        if (mine == theirs + 1) m_Net.Send(Net::EventType::Move, Chess::MoveToUCI(m_Game.History().back().Move));
+        else if (mine != theirs && mine + 1 != theirs) dropOnline("The two games got out of sync, the online game was ended.");
+        break;
+    }
+
+    case Net::EventType::RematchOffer:
+        if (!m_NetBegun || !online() || !m_Game.Over()) break;
+
+        if (m_Rematch == Rematch::Sent) {
+            // both asked at the same moment
+            m_Rematch = Rematch::None;
+            restartOnline();
+        } else if (m_Rematch == Rematch::None) {
+            m_Rematch = Rematch::Received;
+            m_RematchTimer = DrawOfferDuration;
+        }
+        break;
+
+    case Net::EventType::RematchAccept:
+        if (m_Rematch == Rematch::Sent) {
+            m_Rematch = Rematch::None;
+            restartOnline();
+        }
+        break;
+
+    case Net::EventType::RematchDecline:
+        if (m_Rematch == Rematch::Sent) {
+            m_Rematch = Rematch::None;
+            notify("Your opponent declined the rematch");
+        }
+        break;
+
+    case Net::EventType::Move:
+        if (m_NetBegun && online()) receiveMove(event.Text);
+        break;
+
+    case Net::EventType::Resign:
+        if (m_NetBegun && online() && !m_Game.Over()) {
+            m_Game.Resign(Chess::InvertColor(m_PlayerColor));
+            endGame();
+        }
+        break;
+
+    case Net::EventType::DrawOffer:
+        if (m_NetBegun && online() && !m_Game.Over()) {
+            m_Game.OfferDraw(Chess::InvertColor(m_PlayerColor));
+            m_DrawOfferTimer = DrawOfferDuration;
+        }
+        break;
+
+    case Net::EventType::DrawAccept:
+        if (m_NetBegun && online() && m_Game.DrawOfferedBy() == m_PlayerColor) {
+            m_Game.AcceptDraw();
+            endGame();
+        }
+        break;
+
+    case Net::EventType::DrawDecline:
+        if (m_NetBegun && online() && m_Game.DrawOfferedBy() == m_PlayerColor) {
+            m_Game.DeclineDraw();
+            notify("Your opponent declined the draw");
+        }
+        break;
+    }
+}
+
+void Application::receiveMove(const std::string& uci) {
+    if (m_Game.Over()) return;
+
+    const Chess::PieceColor mover = m_Game.SideToMove();
+
+    if (mover == m_PlayerColor) {
+        kickOpponent("Your opponent moved out of turn.");
+        return;
+    }
+
+    const Chess::Board& board = m_Game.Board();
+    const uint64_t pieces = board.GetOccupancyMap(mover);
+
+    for (int square = 0; square < Chess::NullPos; ++square) {
+        if (!(pieces & Chess::IndexToMask(square))) continue;
+
+        for (const Chess::Move& move : board.GetLegalMoves(square)) {
+            if (Chess::MoveToUCI(move) != uci) continue;
+
+            applyMove(move, true);
+            return;
+        }
+    }
+
+    kickOpponent("Your opponent sent an illegal move.");
+}
+
+void Application::forfeitOpponent(const std::string& reason) {
+    leaveInspection();
+
+    if (!m_Game.Over()) {
+        m_Game.Abandon(Chess::InvertColor(m_PlayerColor));
+        endGame();
+    }
+
+    notify(reason, 10.f);
+}
+
+void Application::kickOpponent(const std::string& reason) {
+    m_Net.Close();
+    forfeitOpponent(reason);
+}
+
+void Application::dropOnline(const std::string& reason) {
+    m_Net.Close();
+
+    if (m_WaitDialog && m_Dialog.get() == m_WaitDialog) closeDialog();
+
+    notify(reason, 10.f);
 }
 
 #pragma region Side panel
@@ -684,19 +976,38 @@ void Application::buildPanel() {
     // shows a draw offer that needs an answer, or a short message such as a declined draw
     Column& banner = m_Panel->Add<Column>(10.f, 12.f, 12.f);
     banner.Background(m_Ctx.Pal.WarningBackground, m_Ctx.Pal.Warning, 8.f);
-    banner.ShowIf([this]() { return m_Game.DrawOfferedBy().has_value() || m_MessageTimer > 0.f; });
+    banner.ShowIf([this]() { return m_Game.DrawOfferedBy().has_value() || m_Rematch != Rematch::None || m_MessageTimer > 0.f || (online() && m_Net.Reconnecting()); });
 
     m_BannerText = &banner.Add<Label>("", 14.f, Tone::Warning, true);
 
     Row& answers = banner.Add<Row>(8.f);
-    answers.ShowIf([this]() { return m_Game.DrawOfferedBy().has_value(); });
+    answers.ShowIf([this]() {
+        return m_Rematch == Rematch::Received || (m_Game.DrawOfferedBy().has_value() && (!online() || *m_Game.DrawOfferedBy() != m_PlayerColor));
+    });
 
     answers.Add<Button>("Accept", ButtonKind::Primary, std::nullopt, [this]() {
+        if (m_Rematch == Rematch::Received) {
+            answerRematch(true);
+            return;
+        }
+
+        leaveInspection();
         m_Game.AcceptDraw();
+
+        if (online()) m_Net.Send(Net::EventType::DrawAccept);
+
         endGame();
     });
     answers.Add<Button>("Decline", ButtonKind::Standard, std::nullopt, [this]() {
+        if (m_Rematch == Rematch::Received) {
+            answerRematch(false);
+            return;
+        }
+
         m_Game.DeclineDraw();
+
+        if (online()) m_Net.Send(Net::EventType::DrawDecline);
+
         notify("Draw declined");
     });
 
@@ -709,8 +1020,12 @@ void Application::buildPanel() {
     tools.Add<Button>("Menu", ButtonKind::Tool, Icon::Menu, [this]() { openMenu(); });
 
     Grid& actions = m_Panel->Add<Grid>(2, 8.f);
+    actions.ShowIf([this]() { return !(online() && m_Game.Over()); });
     m_DrawButton = &actions.Add<Button>("Offer Draw", ButtonKind::Standard, std::nullopt, [this]() { offerDraw(); });
     m_ResignButton = &actions.Add<Button>("Resign", ButtonKind::Danger, std::nullopt, [this]() { resign(); });
+
+    m_RematchButton = &m_Panel->Add<Button>("Rematch", ButtonKind::Primary, std::nullopt, [this]() { offerRematch(); });
+    m_RematchButton->ShowIf([this]() { return online() && m_Game.Over(); });
 
     m_BottomCard = &m_Panel->Add<Panel::PlayerCard>();
 }
@@ -722,20 +1037,32 @@ void Application::syncPanel() {
     const bool over = m_Game.Over();
     const bool inspecting = m_Game.Inspecting();
 
-    m_HintButton->SetEnabled(!over && !thinking);
+    const bool net = online();
 
-    m_PlayButton->SetEnabled(thinking || !over);
+    m_HintButton->SetEnabled(!over && !thinking && !net);
+
+    m_PlayButton->SetEnabled(thinking || (!over && !net));
     m_PlayButton->SetLabel(thinking ? "Skip" : "Best Move");
     m_PlayButton->SetIcon(thinking ? UI::Icon::Skip : UI::Icon::Bolt);
 
     m_InspectButton->SetActive(inspecting);
     m_InspectButton->SetEnabled(!thinking && (!over || inspecting));
 
-    m_DrawButton->SetEnabled(!over && !inspecting && !m_Game.DrawOfferedBy());
+    m_DrawButton->SetEnabled(!over && !inspecting && !m_Game.DrawOfferedBy() && (!net || m_Net.Connected()));
     m_ResignButton->SetEnabled(!over && !inspecting);
 
-    if (const auto offer = m_Game.DrawOfferedBy()) m_BannerText->SetText(std::string(ColorName(*offer)) + " offers a draw");
-    else m_BannerText->SetText(m_Message);
+    m_RematchButton->SetEnabled(m_Net.Connected() && m_Rematch == Rematch::None);
+
+    if (net && m_Net.Reconnecting()) {
+        m_BannerText->SetText("Connection lost, reconnecting... " + std::to_string(m_Net.ResumeSecondsLeft()) + "s");
+    } else if (m_Rematch != Rematch::None) {
+        m_BannerText->SetText(m_Rematch == Rematch::Sent ? "Rematch offer sent" : "Your opponent offers a rematch");
+    } else if (const auto offer = m_Game.DrawOfferedBy()) {
+        if (!net) m_BannerText->SetText(std::string(ColorName(*offer)) + " offers a draw");
+        else m_BannerText->SetText(*offer == m_PlayerColor ? "Draw offer sent" : "Your opponent offers a draw");
+    } else {
+        m_BannerText->SetText(m_Message);
+    }
 
     const auto describe = [&](Chess::PieceColor color) {
         Panel::PlayerCard::Data data;
@@ -746,9 +1073,30 @@ void Application::syncPanel() {
 
         if (turn && thinking) data.Subtitle = "Thinking...";
         else if (m_Mode == GameMode::Engine) data.Subtitle = ColorName(color);
+        else if (net) data.Subtitle = std::string(ColorName(color)) + (turn ? " - to move" : "");
         else if (turn) data.Subtitle = "To move";
 
-        if (m_Mode == GameMode::Engine) {
+        if (net) {
+            const bool mine = color == m_PlayerColor;
+            std::string name = mine ? m_Settings.PlayerName : m_Net.PeerName();
+
+            if (name.empty()) name = mine ? "You" : "Opponent";
+
+            // two letters of the name for the avatar
+            std::string initials;
+            for (const char c : name) {
+                if (std::isalnum(static_cast<unsigned char>(c)) && initials.size() < 2) initials += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            }
+
+            if (!mine && !over && m_Net.Reconnecting()) data.Subtitle = "Reconnecting...";
+            else if (!mine && !over && !m_Net.Connected()) data.Subtitle = "Disconnected";
+            else if (!mine && m_Net.Unstable()) data.Subtitle = "Connection unstable...";
+
+            data.Name = name;
+            data.Avatar = mine ? "YOU" : (initials.empty() ? "?" : initials);
+            data.AvatarFill = mine ? pal.Accent : pal.Raised;
+            data.AvatarInk = mine ? pal.OnAccent : pal.Text;
+        } else if (m_Mode == GameMode::Engine) {
             data.Name = isEngine ? std::string(Chess::EngineName) : "You";
             data.Avatar = isEngine ? "AI" : "YOU";
             data.AvatarFill = isEngine ? pal.Raised : pal.Accent;
@@ -763,7 +1111,7 @@ void Application::syncPanel() {
         }
 
         return data;
-    };
+        };
 
     const Chess::PieceColor bottom = m_BoardView.Flipped() ? Chess::PieceColor::Black : Chess::PieceColor::White;
 
@@ -785,6 +1133,13 @@ void Application::closeDialog() {
 // Dialogs are only destroyed here, never from inside one of their own callbacks
 void Application::reapDialogs() {
     if (m_Dialog && m_Dialog->Closed()) {
+        if (m_Dialog.get() == m_WaitDialog) {
+            m_WaitDialog = nullptr;
+            m_WaitCode = m_WaitStatus = m_WaitInfo = nullptr;
+
+            if (!m_NetBegun) m_Net.Close();
+        }
+
         m_Dialog.reset();
 
         if (m_ConfigDirty) {
@@ -813,12 +1168,19 @@ void Application::Update(float deltaTime, sf::Vector2i mousePosition) {
         }
     }
 
+    pumpNetwork(deltaTime);
+
     if (m_ConfigDirty && (m_ConfigTimer -= deltaTime) <= 0.f) {
         applyEngineConfig();
         afterPositionChanged();
     }
 
     if (m_MessageTimer > 0.f) m_MessageTimer -= deltaTime;
+
+    if (m_Rematch != Rematch::None && (m_RematchTimer -= deltaTime) <= 0.f) {
+        m_Rematch = Rematch::None;
+        notify("Rematch offer expired");
+    }
 
     if (m_Game.DrawOfferedBy() && (m_DrawOfferTimer -= deltaTime) <= 0.f) {
         m_Game.DeclineDraw();
@@ -849,7 +1211,7 @@ void Application::Render(sf::RenderTarget& target, sf::Vector2i mousePosition) c
 
     target.clear(m_Ctx.Pal.Window);
 
-    if (m_Settings.ShowEvalBar) {
+    if (evalBarVisible()) {
         m_EvalBar.Render(target, m_EvalBarRect.position, m_EvalBarRect.size, m_BoardView.Flipped(), m_Theme->GetEvaluationBar());
     }
 
@@ -870,8 +1232,6 @@ bool Application::HandleKeyPressed(sf::Keyboard::Scancode key, bool control) {
         return true;
     }
 
-    if (control && key == sf::Keyboard::Scancode::C) copyFen();
-    else if (control && key == sf::Keyboard::Scancode::V) loadFenFromClipboard();
 
     return key != sf::Keyboard::Scancode::Escape;
 }

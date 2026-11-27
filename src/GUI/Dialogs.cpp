@@ -208,6 +208,25 @@ void Application::openMenu() {
         tabs->AddPage("Sound", std::move(page));
     }
 
+    /* Online */ {
+        auto page = std::make_unique<Column>(m_Ctx);
+
+        const auto makeField = [this](const std::string& placeholder, std::string& setting) {
+            auto field = std::make_unique<TextField>(m_Ctx, placeholder);
+            TextField* raw = field.get();
+
+            field->SetValue(setting);
+            field->SetOnChange([raw, &setting]() { setting = raw->Value(); });
+            field->Width(220.f);
+
+            return field;
+        };
+
+        addRow(*page, "Player name", "Shown to your opponent", makeField("Player", m_Settings.PlayerName));
+
+        tabs->AddPage("Online", std::move(page));
+    }
+
     showDialog(std::make_unique<Dialog>(m_Ctx, std::move(tabs), 720.f, 540.f, 0.f));
 }
 
@@ -215,7 +234,7 @@ void Application::openNewGame() {
     using namespace UI;
 
     m_NewGameMode = m_Mode;
-    m_NewGameBlack = m_Mode == GameMode::Engine && m_PlayerColor == Chess::PieceColor::Black;
+    m_NewGameBlack = m_Mode != GameMode::Local && m_PlayerColor == Chess::PieceColor::Black;
 
     auto content = std::make_unique<Column>(m_Ctx, 12.f);
 
@@ -226,31 +245,59 @@ void Application::openNewGame() {
         std::vector<Choice>{
             {"Engine", "Play the computer", Icon::Cpu},
             {"Local", "Two players, one screen", Icon::Users},
-            {"Online", "Coming soon", Icon::Globe, false}
+            {"Online", "Play a friend with a code", Icon::Globe}
         },
         [this]() { return static_cast<int>(m_NewGameMode); },
         [this](int index) { m_NewGameMode = static_cast<GameMode>(index); }
     );
 
-    const auto engineOnly = [this]() { return m_NewGameMode == GameMode::Engine; };
+    const auto isOnline = [this]() { return m_NewGameMode == GameMode::Online; };
+    const auto joining = [this]() { return m_NewGameMode == GameMode::Online && m_NewGameJoin; };
+    const auto hosting = [this]() { return m_NewGameMode == GameMode::Online && !m_NewGameJoin; };
+    const auto choosesSide = [this]() { return m_NewGameMode == GameMode::Engine || (m_NewGameMode == GameMode::Online && !m_NewGameJoin); };
+    const auto choosesPosition = [this]() { return m_NewGameMode != GameMode::Online || !m_NewGameJoin; };
 
-    content->Add<Label>("PLAY AS", 11.5f, Tone::Dim, true).ShowIf(engineOnly);
+    content->Add<Label>("ONLINE", 11.5f, Tone::Dim, true).ShowIf(isOnline);
+    content->Add<ChoiceBar>(
+        std::vector<Choice>{{"Host", "", std::nullopt}, {"Join", "", std::nullopt}},
+        [this]() { return m_NewGameJoin ? 1 : 0; },
+        [this](int index) { m_NewGameJoin = index == 1; }
+    ).ShowIf(isOnline);
+
+    content->Add<Label>("PLAY AS", 11.5f, Tone::Dim, true).ShowIf(choosesSide);
     content->Add<ChoiceBar>(
         std::vector<Choice>{{"White", "", std::nullopt}, {"Black", "", std::nullopt}},
         [this]() { return m_NewGameBlack ? 1 : 0; },
         [this](int index) { m_NewGameBlack = index == 1; }
-    ).ShowIf(engineOnly);
+    ).ShowIf(choosesSide);
 
-    content->Add<Label>("STARTING POSITION", 11.5f, Tone::Dim, true);
+    content->Add<Label>("GAME CODE", 11.5f, Tone::Dim, true).ShowIf(joining);
+
+    Row& codeRow = content->Add<Row>(8.f);
+    codeRow.ShowIf(joining);
+    TextField& codeField = codeRow.Add<TextField>("Enter the code, like K7Q-M2X");
+    codeRow.Add<Button>("Paste", ButtonKind::Standard, std::nullopt, [&codeField]() { codeField.Paste(); }).Width(90.f);
+
+    if (!m_JoinCode.empty()) codeField.SetValue(Net::FormatCode(m_JoinCode));
+
+    // a guest plays the position the host picked
+    content->Add<Label>("STARTING POSITION", 11.5f, Tone::Dim, true).ShowIf(choosesPosition);
 
     Row& position = content->Add<Row>(8.f);
+    position.ShowIf(choosesPosition);
     TextField& field = position.Add<TextField>("Standard position, or paste a FEN");
     position.Add<Button>("Paste", ButtonKind::Standard, std::nullopt, [&field]() { field.Paste(); }).Width(90.f);
+
+    // settings of the room, fixed for the whole game
+    content->Add<Label>("ROOM", 11.5f, Tone::Dim, true).ShowIf(hosting);
+
+    content->Add<FormRow>("Evaluation bar", "Shown to both players during the game", std::make_unique<Toggle>(m_Ctx, m_NewGameEval)).ShowIf(hosting);
 
     Label& error = content->Add<Label>("", 12.5f, Tone::Danger);
 
     Row& footer = content->Add<Row>(10.f);
     footer.Add<Button>("Cancel", ButtonKind::Standard, std::nullopt, [this]() { closeDialog(); });
+
     footer.Add<Button>("Start Game", ButtonKind::Primary, std::nullopt, [this, &field, &error]() {
         if (!field.Value().empty() && !Fen::Parse(field.Value())) {
             error.SetText("That doesn't look like a valid FEN.");
@@ -259,9 +306,67 @@ void Application::openNewGame() {
 
         closeDialog();
         (void)startNewGame(m_NewGameMode, m_NewGameBlack, field.Value());
-    });
+    }).ShowIf([this]() { return m_NewGameMode != GameMode::Online; });
+
+    footer.Add<Button>("Host Game", ButtonKind::Primary, std::nullopt, [this, &field, &error]() {
+        if (!field.Value().empty() && !Fen::Plausible(field.Value())) {
+            error.SetText("That position can't be played online.");
+            return;
+        }
+
+        closeDialog();
+        startHosting(m_NewGameBlack, field.Value(), m_NewGameEval);
+    }).ShowIf(hosting);
+
+    footer.Add<Button>("Join Game", ButtonKind::Primary, std::nullopt, [this, &codeField, &error]() {
+        const std::string code = Net::NormalizeCode(codeField.Value());
+
+        if (code.empty()) {
+            error.SetText("Codes are 6 letters and numbers, like K7Q-M2X.");
+            return;
+        }
+
+        closeDialog();
+        startJoining(code);
+    }).ShowIf(joining);
 
     showDialog(std::make_unique<Dialog>(m_Ctx, std::move(content), 560.f));
+}
+
+void Application::openOnlineWait() {
+    using namespace UI;
+
+    auto content = std::make_unique<Column>(m_Ctx, 14.f);
+
+    content->Add<Header>("Online Game", [this]() { closeDialog(); });
+
+    const auto hosting = [this]() { return m_NetHost; };
+
+    content->Add<Label>("Share this code with your opponent", 14.f, Tone::Dim).ShowIf(hosting);
+
+    Label& code = content->Add<Label>("", 44.f, Tone::Normal, true);
+    code.ShowIf(hosting);
+    m_WaitCode = &code;
+
+    content->Add<Button>("Copy Code", ButtonKind::Standard, std::nullopt, [this]() {
+        sf::Clipboard::setString(Net::FormatCode(m_Net.Code()));
+        m_Sfx.Play(Sfx::Notify);
+    }).ShowIf(hosting);
+
+    m_WaitStatus = &content->Add<Label>("", 15.f, Tone::Normal, true);
+    m_WaitInfo = &content->Add<Label>("", 12.5f, Tone::Dim);
+
+    Row& footer = content->Add<Row>(10.f);
+    footer.Add<Button>("Cancel", ButtonKind::Standard, std::nullopt, [this]() { closeDialog(); });
+    footer.Add<Button>("Try Again", ButtonKind::Primary, std::nullopt, [this]() {
+        if (m_NetHost) m_Net.Host(Net::GenerateCode(), netConfig());
+        else m_Net.Join(m_JoinCode, netConfig());
+    }).ShowIf([this]() { return m_Net.GetState() == Net::Session::State::Closed; });
+
+    auto dialog = std::make_unique<Dialog>(m_Ctx, std::move(content), 480.f);
+
+    m_WaitDialog = dialog.get();
+    showDialog(std::move(dialog));
 }
 
 void Application::openConfirm(std::string title, std::string text, std::string confirmLabel, std::function<void()> onConfirm) {

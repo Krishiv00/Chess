@@ -466,6 +466,7 @@ namespace UI {
         std::function<void()> m_OnChange;
         bool m_Focused{false};
         float m_Time{0.f};
+        float m_Width{0.f};
 
     public:
         TextField(const Context& context, std::string placeholder, std::function<void()> onChange = {}) :
@@ -475,7 +476,12 @@ namespace UI {
         inline const std::string& Value() const noexcept { return m_Value; }
         void Paste();
         void Focus() noexcept { m_Focused = true; }
+        void SetValue(std::string value) { m_Value = std::move(value); }
+        void SetOnChange(std::function<void()> onChange) { m_OnChange = std::move(onChange); }
 
+        TextField& Width(float designUnits) noexcept { m_Width = designUnits; return *this; }
+
+        float PreferredWidth() const override { return m_Ctx.Px(m_Width); }
         float PreferredHeight(float) const override { return m_Ctx.Px(44.f); }
         void Update(float deltaTime, sf::Vector2f mouse) override { m_Time += deltaTime; }
         void Render(const Painter& painter) const override;
@@ -598,6 +604,8 @@ namespace UI {
         bool OnPressed(sf::Vector2f position) override;
         void OnReleased(sf::Vector2f position) override;
         bool OnScroll(sf::Vector2f, float) override { return false; }
+        void OnText(char32_t unicode) override { m_Control->OnText(unicode); }
+        bool OnKey(sf::Keyboard::Scancode key, bool control) override { return m_Control->OnKey(key, control); }
     };
 
     class TabView final : public Widget {

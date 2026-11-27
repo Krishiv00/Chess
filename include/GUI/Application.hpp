@@ -13,6 +13,8 @@
 #include "GUI/Game/EngineRunner.hpp"
 #include "GUI/Game/Game.hpp"
 
+#include "GUI/Net/Session.hpp"
+
 #include "GUI/BoardView.hpp"
 #include "GUI/Settings.hpp"
 #include "GUI/SoundSystem.hpp"
@@ -83,8 +85,33 @@ private:
     void endGame();
     void updateEvaluation();
     void copyFen();
-    void loadFenFromClipboard();
-    void notify(std::string text);
+    void notify(std::string text, float seconds = 3.f);
+
+    // Online
+    [[nodiscard]]
+    inline bool online() const noexcept {
+        return m_Mode == GameMode::Online;
+    }
+
+    [[nodiscard]]
+    Net::Session::Config netConfig() const;
+
+    [[nodiscard]]
+    bool evalBarVisible() const noexcept;
+
+    void startHosting(bool playAsBlack, const std::string& fen, bool evalBar);
+    void startJoining(const std::string& code);
+    bool beginOnlineGame(bool playAsBlack, const std::string& fen);
+    void leaveInspection();
+    void offerRematch();
+    void answerRematch(bool accept);
+    void restartOnline();
+    void pumpNetwork(float deltaTime);
+    void handleNetEvent(const Net::Event& event);
+    void receiveMove(const std::string& uci);
+    void dropOnline(const std::string& reason);
+    void forfeitOpponent(const std::string& reason);
+    void kickOpponent(const std::string& reason);
 
     // Settings
     void applyEngineConfig();
@@ -104,6 +131,7 @@ private:
     void openMenu();
     void openNewGame();
     void openConfirm(std::string title, std::string text, std::string confirmLabel, std::function<void()> onConfirm);
+    void openOnlineWait();
 
     Game m_Game;
     EngineRunner m_Engine{m_Game.Board()};
@@ -160,6 +188,27 @@ private:
     // what the new game dialog shows, lives as long as the app does
     GameMode m_NewGameMode{GameMode::Local};
     bool m_NewGameBlack{false};
+    bool m_NewGameJoin{false};
+    bool m_NewGameEval{true};
+
+    // Online
+    Net::Session m_Net;
+    bool m_NetHost{false};
+    bool m_NetHostBlack{false};
+    bool m_NetBegun{false};
+    bool m_NetEval{true};
+    std::string m_NetFen;
+
+    enum class Rematch : uint8_t { None, Sent, Received };
+    Rematch m_Rematch{Rematch::None};
+    float m_RematchTimer{0.f};
+    UI::Button* m_RematchButton{nullptr};
+    std::string m_JoinCode;
+
+    const UI::Dialog* m_WaitDialog{nullptr};
+    UI::Label* m_WaitCode{nullptr};
+    UI::Label* m_WaitStatus{nullptr};
+    UI::Label* m_WaitInfo{nullptr};
 
 public:
     Application();

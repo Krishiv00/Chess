@@ -2,6 +2,7 @@
 .zed/
 
 build/
+dist/
 
 Settings.cfg
 *.pgn

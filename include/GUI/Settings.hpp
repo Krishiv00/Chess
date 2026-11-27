@@ -57,6 +57,9 @@ struct Settings {
     bool SoundEnabled{true};
     int Volume{100};
 
+    // Online
+    std::string PlayerName;
+
     // Window
     int WindowWidth{0};
     int WindowHeight{0};

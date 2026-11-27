@@ -89,6 +89,12 @@ void Game::Resign(Chess::PieceColor loser) {
     m_DrawOfferedBy.reset();
 }
 
+void Game::Abandon(Chess::PieceColor loser) {
+    m_Result = GameResult::Abandoned;
+    m_Winner = Chess::InvertColor(loser);
+    m_DrawOfferedBy.reset();
+}
+
 void Game::OfferDraw(Chess::PieceColor by) {
     if (!Over()) m_DrawOfferedBy = by;
 }
@@ -195,6 +201,50 @@ std::optional<Fen::Parsed> Fen::Parse(const std::string& text) {
     }
 
     return result;
+}
+
+bool Fen::Plausible(const std::string& text) {
+    const std::optional<Parsed> parsed = Parse(text);
+
+    if (!parsed) return false;
+
+    std::istringstream stream(parsed->Text);
+    std::string placement, side, castling, enPassant;
+    stream >> placement >> side >> castling >> enPassant;
+
+    char board[64] = {};
+    int square = 0;
+
+    for (const char c : placement) {
+        if (c == '/') continue;
+        if (c >= '1' && c <= '8') square += c - '0';
+        else board[square++] = c;
+    }
+
+    for (const char right : castling) {
+        const bool ok = right == 'K' ? board[60] == 'K' && board[63] == 'R'
+                      : right == 'Q' ? board[60] == 'K' && board[56] == 'R'
+                      : right == 'k' ? board[4] == 'k' && board[7] == 'r'
+                      : right == 'q' ? board[4] == 'k' && board[0] == 'r'
+                      : true; // "-"
+
+        if (!ok) return false;
+    }
+
+    if (enPassant != "-") {
+        const int file = enPassant[0] - 'a';
+        const bool whiteToMove = side == "w";
+
+        if (whiteToMove != (enPassant[1] == '6')) return false;
+
+        const int target = (whiteToMove ? 2 : 5) * 8 + file;
+        const int pawn = target + (whiteToMove ? 8 : -8);
+        const int origin = target + (whiteToMove ? -8 : 8);
+
+        if (board[target] || board[origin] || board[pawn] != (whiteToMove ? 'p' : 'P')) return false;
+    }
+
+    return true;
 }
 
 #pragma region Notation

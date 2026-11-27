@@ -22,15 +22,10 @@ ENGINE_SRC := $(call rwildcard,$(SRC_DIR)/Engine,*.cpp)
 GUI_SRC := $(call rwildcard,$(SRC_DIR)/GUI,*.cpp)
 UCI_SRC := $(call rwildcard,$(SRC_DIR)/UCI,*.cpp)
 
-GUI_DEV_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/%.o,$(GUI_SRC)) \
-               $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/GUI/%.o,$(ENGINE_SRC))
-GUI_REL_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/%.o,$(GUI_SRC)) \
-               $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/GUI/%.o,$(ENGINE_SRC))
-UCI_DEV_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/%.o,$(UCI_SRC)) \
-               $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/UCI/%.o,$(ENGINE_SRC))
-UCI_REL_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/%.o,$(UCI_SRC)) \
-               $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/UCI/%.o,$(ENGINE_SRC))
-
+GUI_DEV_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/%.o,$(GUI_SRC)) $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/GUI/%.o,$(ENGINE_SRC))
+GUI_REL_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/%.o,$(GUI_SRC)) $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/GUI/%.o,$(ENGINE_SRC))
+UCI_DEV_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/%.o,$(UCI_SRC)) $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/dev/UCI/%.o,$(ENGINE_SRC))
+UCI_REL_OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/%.o,$(UCI_SRC)) $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/release/UCI/%.o,$(ENGINE_SRC))
 
 UCI_INC := -I$(INCLUDE_DIR) -I$(INCLUDE_DIR)/Engine -I$(INCLUDE_DIR)/UCI
 GUI_INC := -I$(INCLUDE_DIR) -I$(INCLUDE_DIR)/Engine -I$(INCLUDE_DIR)/GUI -I$(SFML_INCLUDE)
@@ -41,13 +36,8 @@ UCI_REL_FLAGS := $(STD) $(UCI_INC) -fno-exceptions -O3 -DNDEBUG -ffunction-secti
 GUI_DEV_FLAGS := $(STD) $(GUI_INC) -fno-exceptions -Os -pipe -MMD -MP -DSFML_DYNAMIC
 GUI_REL_FLAGS := $(STD) $(GUI_INC) -fno-exceptions -O3 -DNDEBUG -DSFML_STATIC -ffunction-sections -fdata-sections -fmerge-all-constants
 
-
-GUI_DEV_LIBS := -L$(SFML_LIB) -lsfml-graphics -lsfml-window -lsfml-audio -lsfml-system
-
-GUI_REL_LIBS := -L$(SFML_LIB) -lsfml-graphics-s -lsfml-window-s -lsfml-audio-s -lsfml-system-s \
-                -lfreetype -lopengl32 -lgdi32 -lwinmm \
-                -lflac -lvorbisenc -lvorbisfile -lvorbis -logg \
-                -lpthread
+GUI_DEV_LIBS := -L$(SFML_LIB) -lsfml-graphics -lsfml-window -lsfml-audio -lsfml-network -lsfml-system
+GUI_REL_LIBS := -L$(SFML_LIB) -lsfml-graphics-s -lsfml-window-s -lsfml-audio-s -lsfml-network-s -lsfml-system-s -lfreetype -lharfbuzz -lmbedtls -lmbedx509 -lmbedcrypto -lopengl32 -lgdi32 -lwinmm -lws2_32 -ldnsapi -lflac -lvorbisenc -lvorbisfile -lvorbis -logg -lpthread -lbcrypt -lcrypt32
 
 ifneq ($(wildcard $(ICON_FILE)),)
 RES_OBJ := $(BUILD_DIR)/resource.o

@@ -109,11 +109,11 @@ All special moves are correctly flagged for search and evaluation purposes.
 
 # Graphical Interface
 
-The GUI is built using **SFML 3** and plays against the engine, or between two people on one screen. It is built separately from the UCI implementation (`make gui`) and only uses `src/Engine` and `src/GUI`.
+The GUI is built using **SFML 3** and plays against the engine, between two people on one screen, or between two people online. It is built separately from the UCI implementation (`make gui`) and only uses `src/Engine` and `src/GUI`.
 
 ## Playing
 
-* **game modes:** play against the engine (as White or Black), or local play on one screen.
+* **game modes:** play against the engine (as White or Black), local play on one screen, or online play with a friend (see [Online play](#online-play)).
 * **custom starting positions:** type or paste a FEN when starting a game
 * drag-and-drop and click-based piece movement
 * legal move highlighting with capture indicators
@@ -121,12 +121,12 @@ The GUI is built using **SFML 3** and plays against the engine, or between two p
 * arrow drawing and square markers
 * move list in standard algebraic notation, with check and mate marks
 * **Best Move** plays the engine's best move for the side to move (turning into **Skip** while it thinks), **Hint** only draws it as an arrow
-* **Offer Draw** and **Resign**. The engine only accepts a draw when the position is about equal. In local play the offer appears as an Accept / Decline banner
+* **Offer Draw** and **Resign**. The engine only accepts a draw when the position is about equal. In local and online play the offer appears as an Accept / Decline banner, and online games can offer a rematch afterwards
 * game over detection (checkmate, stalemate, fifty-move rule, repetition, insufficient material, agreement, resignation) with a result card and particle effects
 * evaluation bar with live updating
 * inspection mode for position analysis, leaving it restores the game
 * board flipping
-* FEN copy and paste support (`Ctrl + C` / `Ctrl + V`)
+* FEN copy and paste from the menu and the FEN fields
 * sound effects for moves, captures, checks, promotions, castling, game start and game end
 
 ## Menu
@@ -135,6 +135,7 @@ Everything that isn't needed during a game lives in the menu (scrollable, tabbed
 
 * **Game:** new game, copy FEN, switch the side to move
 * **Engine:** search by time or by depth, think time, search depth, evaluation depth, opening book, pondering, catch-all mode, hash size and thread count. Steppers repeat while held, and the think time step grows with the value
+* **Online:** your player name
 * **Display:** board theme, piece set, evaluation bar, move list and coordinate labels
 * **Sound:** sound effects and volume
 
@@ -147,6 +148,19 @@ The engine features a **runtime-switchable theme system** that replicates the lo
 Themes control both visual appearance (colors, rendering styles) and behavioral differences (hover feedback, drag indicators), allowing faithful recreation of different platform experiences. The interface follows the theme as well: neutral greys stay fixed, while buttons, toggles and highlights take the accent of the theme's dark squares. A new theme is a class that inherits from `Theme`, sets its own name in its constructor and is added to the list in `Themes.hpp`, whose order is the order in the menu.
 
 Piece sets are discovered at startup: drop a `.png` with the six pieces of both colors (one row per color) into `Resources/Textures/Pieces/` and it shows up in the menu, named after the file.
+
+---
+
+# Online play
+
+Pick **Online** in New Game. The host gets a short game code, the guest types it, and that's it.
+
+* the game first looks for the host on the **local network**, so nothing else is needed to play at home (it works even with no internet)
+* otherwise it falls back to a small **relay** (`scripts/relay.py`, plain Python, no packages) that passes moves between the two players
+* the host chooses the colour, a custom starting FEN and whether the evaluation bar is shown to both players
+* a dropped connection is given a minute to come back, after that the player who stayed wins
+
+Nothing from the other player is trusted blindly: every move is checked against the local legal moves, and a starting position is validated before the engine sees it.
 
 ---
 
@@ -206,7 +220,7 @@ Rating is measured via a gauntlet against Stockfish at limited strength levels (
 # Requirements
 
 * **C++20 or later**
-* **SFML 3.x** (for GUI only)
+* **SFML 3.1 or later** (for GUI only)
 
 ---
 

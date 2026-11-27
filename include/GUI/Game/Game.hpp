@@ -15,6 +15,9 @@ namespace Fen {
 
     [[nodiscard]]
     std::optional<Parsed> Parse(const std::string& text);
+
+    [[nodiscard]]
+    bool Plausible(const std::string& text);
 }
 
 namespace Notation {
@@ -30,7 +33,8 @@ enum class GameResult : uint8_t {
     DrawRepetition,
     DrawInsufficient,
     DrawAgreement,
-    Resignation
+    Resignation,
+    Abandoned,
 };
 
 class Game final {
@@ -74,6 +78,7 @@ public:
     void FlipSideToMove();
 
     void Resign(Chess::PieceColor loser);
+    void Abandon(Chess::PieceColor loser);
     void OfferDraw(Chess::PieceColor by);
     void AcceptDraw();
 
