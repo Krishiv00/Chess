@@ -732,4 +732,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    while True:
+        usr_inpt = input().lower()
+
+        if not usr_inpt or usr_inpt == "start":
+            break
+
+        if usr_inpt.startswith("time "):
+            MOVETIME_MS = int(usr_inpt.removeprefix("time "))
+            DEPTH = None
+            print(f"set movetime to {MOVETIME_MS}")
+        elif usr_inpt.startswith("depth "):
+            DEPTH = int(usr_inpt.removeprefix("depth "))
+            print(f"set depth to {DEPTH}")
+
     main()
