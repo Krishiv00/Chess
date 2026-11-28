@@ -145,9 +145,26 @@ Settings are saved to `Settings.cfg` and restored on the next launch.
 
 The engine features a **runtime-switchable theme system** that replicates the look and feel of popular chess platforms like `Lichess` and `Chesscom`.
 
-Themes control both visual appearance (colors, rendering styles) and behavioral differences (hover feedback, drag indicators), allowing faithful recreation of different platform experiences. The interface follows the theme as well: neutral greys stay fixed, while buttons, toggles and highlights take the accent of the theme's dark squares. A new theme is a class that inherits from `Theme`, sets its own name in its constructor and is added to the list in `Themes.hpp`, whose order is the order in the menu.
+Themes control both visual appearance (colors, rendering styles) and behavioral differences (hover feedback, drag indicators), allowing faithful recreation of different platform experiences. The interface follows the theme as well: neutral greys stay fixed, while buttons, toggles and highlights take the accent of the theme's dark squares. A new theme is a class that inherits from `Theme`, sets its own name in its constructor and is added to the list in `Themes.hpp`.
 
 Piece sets are discovered at startup: drop a `.png` with the six pieces of both colors (one row per color) into `Resources/Textures/Pieces/` and it shows up in the menu, named after the file.
+
+**Custom piece sets**
+
+A Python utility (`scripts/generate_piece_set.py`) is provided to generate compatible sprite sheets from individual piece images.
+
+- Supports **PNG** and **SVG** (SVG requires `resvg-py`).
+- Expects 12 files named `wP`, `wB`, ..., `bK`, all using the same format.
+- Automatically handles sizing, centering and sprite sheet generation.
+
+**Usage:**
+
+```bash
+pip install pillow resvg-py
+python scripts/generate_piece_set.py set1 set2
+```
+
+The script generates `set1.png` and `set2.png` alongside the input folder. Place it in `Resources/Textures/Pieces/` and it will be automatically detected at startup.
 
 ---
 

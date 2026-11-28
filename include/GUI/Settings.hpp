@@ -48,7 +48,7 @@ struct Settings {
 
     // Display
     std::string Theme;
-    std::string PieceSet{"chesscom"};
+    std::string PieceSet{"neo"};
     bool ShowEvalBar{true};
     bool ShowMoveList{true};
     bool ShowCoordinates{true};
@@ -63,7 +63,7 @@ struct Settings {
     // Window
     int WindowWidth{0};
     int WindowHeight{0};
-    bool WindowMaximized{false};
+    bool WindowMaximized{true};
 
     void Load(const std::filesystem::path& path);
     void Save(const std::filesystem::path& path) const;
