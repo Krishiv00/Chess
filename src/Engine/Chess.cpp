@@ -897,23 +897,6 @@ namespace LUTs {
     // king zone: king square + ring + one extra rank towards the enemy
     static inline uint64_t KingZone[2][64];
 
-    // scores for knight mobility, legal moves
-    static constexpr inline int KnightMobilityScore[] = {
-        -24, -12, -4, 0, 6, 10, 12, 14, 16
-    };
-    // scores for bishop mobility, legal moves
-    static constexpr inline int BishopMobilityScore[] = {
-        -10, -5, -2, 0, 2, 4, 6, 7, 8, 9, 10, 10, 10, 10
-    };
-    // scores for rook mobility, legal moves
-    static constexpr inline int RookMobilityScore[] = {
-        -8, -4, -2, 0, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 8
-    };
-    // scores for queen mobility, legal moves
-    static constexpr inline int QueenMobilityScore[] = {
-        -6, -3, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10
-    };
-
     static inline void InitAttks() {
         for (int sq = 0; sq < Ranks * Files; ++sq) {
             const int r = ToRank(sq);
@@ -1148,178 +1131,345 @@ void Chess::Board::NewGame() {
     );
 }
 
-#pragma region PST
+#pragma region Evaluation Weights
 
-namespace PieceSquareTables {
-    static constexpr inline const int8_t TableRaw[][Ranks * Files] = {
-        // pawn earlygame
-        {
-            -46, -46, -46, -46, -46, -46, -46, -46,
-            36, 75, 37, 100, 68, 81, -38, -80,
-            -72, -42, -6, 2, 12, 32, 16, -42,
-            -84, -52, -47, -43, -15, -27, -11, -47,
-            -100, -60, -65, -40, -37, -51, -22, -68,
-            -100, -65, -64, -68, -43, -58, -6, -51,
-            -98, -60, -69, -81, -53, -27, 22, -49,
-            -46, -46, -46, -46, -46, -46, -46, -46
-        },
+namespace {
+    struct Score {
+        int mg{0};
+        int eg{0};
 
-        // bishop earlygame
-        {
-            -21, -54, -61, -100, -96, -67, 21, -51,
-            -14, 32, 0, -14, 14, 75, 18, 25,
-            1, 38, 61, 70, 68, 100, 87, 28,
-            -16, 4, 41, 64, 50, 46, 1, -1,
-            -21, -3, 8, 36, 38, 5, 8, -20,
-            -4, 9, 5, 9, 9, 8, 3, 18,
-            0, 3, 16, -14, -3, 21, 38, 4,
-            -39, -8, -25, -32, -30, -36, -12, -14
-        },
+        constexpr Score() = default;
+        constexpr Score(int m, int e) : mg(m), eg(e) {}
 
-        // knight earlygame
-        {
-            100, -100, -40, -53, 11, -91, -85, -80,
-            -47, -18, 27, 14, 29, 66, -4, 2,
-            -11, 18, 22, 41, 69, 100, 35, 27,
-            -23, -13, 7, 29, 7, 33, -9, 7,
-            -35, -20, -10, -11, -1, -4, 0, -28,
-            -50, -33, -19, -18, -7, -18, -15, -40,
-            -55, -53, -36, -27, -27, -24, -30, -31,
-            -97, -47, -65, -51, -49, -36, -49, -75
-        },
-
-        // rook earlygame
-        {
-            25, 29, 39, 44, 68, 87, 98, 100,
-            -23, -31, -6, 15, -3, 27, 28, 75,
-            -44, -27, -25, -11, 10, 17, 72, 13,
-            -68, -55, -47, -29, -28, -26, -23, -30,
-            -91, -86, -75, -58, -54, -69, -51, -75,
-            -99, -82, -76, -71, -63, -65, -34, -62,
-            -100, -83, -69, -66, -61, -56, -40, -93,
-            -83, -78, -68, -47, -50, -58, -67, -100
-        },
-
-        // queen earlygame
-        {
-            -63, -21, 27, 55, 64, 100, 87, 25,
-            -50, -76, -68, -81, -78, 14, -28, 82,
-            -47, -50, -42, -29, -12, 25, 50, 17,
-            -64, -63, -60, -57, -51, -37, -34, -28,
-            -69, -63, -67, -59, -57, -54, -46, -41,
-            -68, -55, -64, -61, -59, -56, -36, -44,
-            -69, -61, -48, -41, -48, -31, -20, -3,
-            -74, -86, -70, -54, -67, -81, -86, -100
-        },
-
-        // king earlygame
-        {
-            -50, -75, -75, -100, -100, -75, -75, -50,
-            -50, -75, -75, -100, -100, -75, -75, -50,
-            -50, -75, -75, -100, -100, -75, -75, -50,
-            -50, -75, -75, -100, -100, -75, -75, -50,
-            -25, -50, -50, -75, -75, -50, -50, -25,
-            0, -25, -25, -25, -25, -25, -25, 0,
-            75, 75, 25, 25, 25, 25, 75, 75,
-            75, 100, 50, 25, 25, 50, 100, 75
-        },
-
-        // pawn endgame
-        {
-            -90, -90, -90, -90, -90, -90, -90, -90,
-            94, 85, 81, 27, 20, 36, 94, 100,
-            30, 32, 0, -24, -36, -46, -1, 0,
-            -44, -57, -77, -90, -99, -94, -76, -71,
-            -68, -73, -91, -97, -100, -96, -85, -88,
-            -75, -75, -93, -82, -89, -90, -82, -91,
-            -69, -69, -78, -72, -74, -80, -81, -91,
-            -90, -90, -90, -90, -90, -90, -90, -90
-        },
-
-        // bishop endgame
-        {
-            -29, 23, 13, 52, 45, 13, -23, -29,
-            -61, 3, 26, 32, 19, -26, 26, -58,
-            39, 3, 42, 13, 23, 35, -13, 19,
-            19, 87, 52, 97, 77, 55, 71, 13,
-            6, 58, 100, 68, 68, 81, 52, -19,
-            0, 39, 61, 61, 81, 61, 16, -19,
-            -16, -26, -13, 35, 52, 6, 13, -71,
-            -74, -10, -81, 13, 0, 10, -55, -100
-        },
-
-        // knight endgame
-        {
-            -56, 8, 28, 29, 19, 14, 24, -100,
-            18, 37, 35, 48, 32, 12, 24, -8,
-            25, 42, 74, 69, 41, 35, 29, 5,
-            42, 78, 88, 95, 95, 83, 70, 31,
-            46, 61, 93, 97, 100, 84, 62, 42,
-            23, 52, 66, 88, 86, 58, 46, 25,
-            10, 40, 50, 54, 52, 53, 35, 27,
-            3, -22, 29, 37, 33, 31, -16, -11
-        },
-
-        // rook endgame
-        {
-            8, 32, 64, 52, 20, -12, -36, -52,
-            20, 100, 92, 56, 60, 36, 8, -92,
-            40, 52, 52, 40, -8, -40, -80, -76,
-            56, 44, 76, 52, 0, -28, -40, -56,
-            36, 52, 64, 44, 36, 32, -20, -20,
-            16, 8, 8, 24, 16, -20, -96, -84,
-            -8, -4, 8, 20, -16, -32, -88, -44,
-            -36, 16, 44, 32, 8, -8, -24, -100
-        },
-
-        // queen endgame
-        {
-            17, 17, 28, 20, 9, 7, -10, 16,
-            -10, 33, 68, 89, 100, 64, 88, 11,
-            -1, 17, 51, 55, 78, 52, 1, 11,
-            5, 31, 47, 66, 84, 61, 54, 34,
-            3, 32, 38, 60, 56, 44, 35, 22,
-            -4, -6, 31, 22, 31, 31, 7, -6,
-            -9, -8, -20, -11, 0, -28, -57, -100,
-            -16, -18, -16, -27, -9, -9, -38, -50
-        },
-
-        // king endgame
-        {
-            -100, -78, -56, -33, -33, -56, -78, -100,
-            -56, -33, -11, 11, 11, -11, -33, -56,
-            -56, -11, 56, 78, 78, 56, -11, -56,
-            -56, -11, 78, 100, 100, 78, -11, -56,
-            -56, -11, 78, 100, 100, 78, -11, -56,
-            -56, -11, 56, 78, 78, 56, -11, -56,
-            -56, -56, 11, 11, 11, 11, -56, -56,
-            -100, -56, -56, -56, -56, -56, -56, -100
-        },
+        constexpr Score& operator+=(const Score& o) noexcept {
+            mg += o.mg; eg += o.eg; return *this;
+        }
+        constexpr Score& operator-=(const Score& o) noexcept {
+            mg -= o.mg; eg -= o.eg; return *this;
+        }
     };
 
-    static constexpr auto BuildTable() {
-        std::array<std::array<int8_t, Ranks* Files>, 12> t{};
-
-        for (int i = 0; i < 12; ++i) {
-            for (int sq = 0; sq < Ranks * Files; ++sq) t[i][sq] = TableRaw[i][sq];
-        }
-
-        for (const int i : {1, 2, 4, 7, 8, 10, 9}) {
-            for (int r = 0; r < Ranks; ++r) {
-                for (int f = 0; f < Files / 2; ++f) {
-                    const int a = r * Files + f;
-                    const int b = r * Files + (Files - 1 - f);
-                    const int avg = (TableRaw[i][a] + TableRaw[i][b]) / 2;
-                    t[i][a] = static_cast<int8_t>(avg);
-                    t[i][b] = static_cast<int8_t>(avg);
-                }
-            }
-        }
-
-        return t;
+    constexpr Score operator+(Score a, const Score& b) noexcept {
+        return a += b;
     }
 
-    static constexpr inline auto Table = BuildTable();
+    constexpr Score operator-(Score a, const Score& b) noexcept {
+        return a -= b;
+    }
+
+    constexpr Score operator*(const Score& a, int k) noexcept {
+        return Score(a.mg * k, a.eg * k);
+    }
+
+    [[nodiscard]]
+    constexpr inline int ChebDist(int a, int b) noexcept {
+        return std::max(std::abs(ToRank(a) - ToRank(b)), std::abs(ToFile(a) - ToFile(b)));
+    }
+
+    [[nodiscard]]
+    constexpr inline int ManhattanDist(int a, int b) noexcept {
+        return std::abs(ToRank(a) - ToRank(b)) + std::abs(ToFile(a) - ToFile(b));
+    }
+
+    // Material (middlegame, endgame), indexed by piece type: pawn, bishop, knight, rook, queen, king
+    constexpr Score PieceValue[] = {
+        {100, 100}, {278, 365}, {288, 291}, {411, 621},
+        {838, 1103}, {0, 0}
+    };
+
+    // Pawn structure
+    constexpr Score Isolated{-1, -17};
+    constexpr Score IsolatedOpen{-3, 16};
+    constexpr Score Backward{-14, -11};
+    constexpr Score BackwardOpen{-2, 40};
+    constexpr Score Doubled{-12, 10};
+    constexpr Score DoubledPassed{-12, -34};
+    constexpr Score ConnectedPassers{-15, 20};
+
+    // Pawn structure, indexed by how far the pawn has advanced (1 = starting rank)
+    constexpr Score Supported[] = {
+        {0, 0}, {0, 0}, {10, 22}, {6, 15},
+        {26, 22}, {82, 12}, {141, -40}, {0, 0}
+    };
+
+    constexpr Score Phalanx[] = {
+        {0, 0}, {1, 6}, {8, 10}, {8, 12},
+        {4, 37}, {-33, 0}, {34, 38}, {0, 0}
+    };
+
+    constexpr Score Candidate[] = {
+        {0, 0}, {0, 0}, {0, 0}, {-5, 50},
+        {-3, 36}, {-58, 110}, {18, 45}, {0, 0}
+    };
+
+    // King pawn shield and open files in front of the king
+    constexpr Score ShieldMissing1{-5, 7};
+    constexpr Score ShieldMissing2{-2, -3};
+    constexpr Score KingFileSemi{-3, -10};
+    constexpr Score KingFileOpen{-30, -15};
+
+    // Passed pawns: base value by advancement, bonus by file
+    constexpr Score PassedBase[] = {
+        {0, 0}, {28, 51}, {27, 86}, {24, 123},
+        {48, 145}, {70, 147}, {3, 225}, {245, 490}
+    };
+
+    constexpr Score PassedFile[] = {
+        {5, 4}, {24, 2}, {29, -8}, {-16, -3},
+        {-14, -1}, {-26, -15}, {-71, 6}, {-11, 21}
+    };
+
+    // Passed pawns: blocked / path / king distance / rule of the square
+    constexpr int PassedBlockedPct = 63;
+    constexpr int PassedBehindPct = 73;
+    constexpr int KingProxOpp = 19;
+    constexpr int KingProxOwn = 3;
+    constexpr int PathFree = 69;
+    constexpr int PathClear = 43;
+    constexpr int PathStop = 11;
+    constexpr int PathDefended = 14;
+    constexpr int PathDiv = 6;
+    constexpr int UnstoppableEg = 230;
+
+    // Mobility, indexed by the number of safe squares attacked
+    constexpr Score KnightMobility[] = {
+        {-8, -49}, {1, -17}, {8, -5}, {7, 22},
+        {16, 16}, {14, 23}, {19, 26}, {25, 11},
+        {33, 7}
+    };
+
+    constexpr Score BishopMobility[] = {
+        {-7, -19}, {15, 16}, {16, 14}, {18, 36},
+        {22, 27}, {21, 27}, {27, 17}, {22, 43},
+        {30, 20}, {5, 37}, {33, 23}, {-1, 10},
+        {27, 26}, {196, -41}
+    };
+
+    constexpr Score RookMobility[] = {
+        {-21, 2}, {-8, 12}, {3, 22}, {4, 36},
+        {1, 30}, {12, 19}, {11, 28}, {16, 33},
+        {9, 43}, {7, 45}, {-1, 49}, {2, 46},
+        {23, 38}, {13, 32}, {14, 36}
+    };
+
+    constexpr Score QueenMobility[] = {
+        {32, -7}, {14, -3}, {11, -150}, {7, -69},
+        {2, -28}, {3, -39}, {1, -40}, {3, 39},
+        {6, 21}, {2, 17}, {7, 16}, {15, 21},
+        {23, 31}, {23, 40}, {19, 60}, {22, 52},
+        {27, 42}, {33, 29}, {1, 76}, {26, 30},
+        {26, 16}, {29, 20}, {32, 5}, {31, -50},
+        {33, 39}, {33, 40}, {34, 43}, {35, 45}
+    };
+
+    // Minor pieces
+    constexpr Score BishopPair{45, 68};
+    constexpr Score KnightFork{-14, 143};
+    constexpr Score KnightOutpost{12, 23};
+    constexpr Score KnightReach{12, 18};
+    constexpr Score BishopOutpost{30, -11};
+    constexpr Score BishopReach{7, 3};
+    constexpr Score MinorBehind{3, -1};
+    constexpr Score KingProtector{-4, 4};
+    constexpr Score BadBishop{-2, -1};
+    constexpr Score LongDiagonal{11, 13};
+
+    // Rooks
+    constexpr Score RookOpen{17, 19};
+    constexpr Score RookSemi{1, 18};
+    constexpr Score TrappedRook{-13, 7};
+    constexpr Score RookOnPawn{-10, 3};
+    constexpr Score RookBehindPasser{15, 12};
+
+    // King safety: attack units per attacking piece / safe check, scaled by the number of attackers
+    constexpr int UnitBishop = -2;
+    constexpr int UnitKnight = 12;
+    constexpr int UnitRook = 15;
+    constexpr int UnitQueen = 45;
+    constexpr int CheckKnight = 95;
+    constexpr int CheckBishop = 85;
+    constexpr int CheckRook = 204;
+    constexpr int CheckQueen = 80;
+    constexpr int AttackerScale[] = {24, 40, 62, 114, 144, 100, 100, 100, 100};
+    constexpr int ZoneHitUnit = 1;
+    constexpr int QueenlessPct = 69;
+    constexpr int DangerCap = 205;
+    constexpr int WeakRingUnit = 24;
+    constexpr int KnightDefUnit = -39;
+    constexpr int BishopDefUnit = -7;
+    constexpr Score FlankAttack{3, -2};
+
+    // Threats
+    constexpr Score PawnAttackMinor{79, 96};
+    constexpr Score PawnAttackRook{98, 20};
+    constexpr Score PawnAttackQueen{58, 19};
+    constexpr Score MinorAttackRook{59, 41};
+    constexpr Score MinorAttackQueen{56, 15};
+    constexpr Score RookAttackQueen{105, 47};
+    constexpr Score WeakPawnByMinor{4, 9};
+    constexpr Score WeakKnightByMinor{11, 10};
+    constexpr Score WeakBishopByMinor{36, 19};
+    constexpr Score WeakPawnByRook{3, 11};
+    constexpr Score WeakMinorByRook{15, 25};
+    constexpr Score WeakRookByRook{-7, -11};
+    constexpr Score KingThreat{60, 28};
+    constexpr Score HangingPiece{28, 20};
+    constexpr Score HangingPawn{12, 19};
+    constexpr Score Restricted{5, 8};
+    constexpr Score PawnPush{16, 22};
+    constexpr Score KnightOnQueen{18, 4};
+    constexpr Score SliderOnQueen{20, -1};
+
+    // Material imbalance: per pawn above / below five
+    constexpr Score KnightPerPawn{11, 9};
+    constexpr Score RookPerPawn{-4, -1};
+
+    // Endgame scaling (out of 64) and tempo
+    constexpr int ScaleNoPawnsWeakPawns = 19;
+    constexpr int ScaleNoPawns = 31;
+    constexpr int ScaleOcbLead = 21;
+    constexpr int ScaleOcb = 29;
+    constexpr int ScaleOcbRooks = 39;
+    constexpr int ScaleBase = 42;
+    constexpr int ScalePerPawn = 7;
+    constexpr int Tempo = 27;
+}
+
+namespace PieceSquareTables {
+    constexpr int16_t Table[12][Ranks * Files] = {
+        // Pawn, middlegame
+        {
+            -46, -46, -46, -46, -46, -46, -46, -46,
+            33, 68, 34, 98, 57, 73, -61, -86,
+            -71, -45, -5, 4, 5, 28, -3, -44,
+            -81, -53, -44, -39, -20, -29, -28, -47,
+            -96, -60, -61, -35, -41, -52, -38, -67,
+            -97, -66, -61, -64, -48, -60, -23, -51,
+            -94, -60, -65, -76, -57, -28, 6, -48,
+            -46, -46, -46, -46, -46, -46, -46, -46
+        },
+        // Bishop, middlegame
+        {
+            -55, -38, -88, -116, -116, -88, -38, -55,
+            -1, 16, 26, -5, -5, 26, 16, -1,
+            -11, 34, 50, 45, 45, 50, 34, -11,
+            -1, 6, 45, 65, 65, 45, 6, -1,
+            -16, 3, 5, 42, 42, 5, 3, -16,
+            6, 2, 0, 9, 9, 0, 2, 6,
+            4, 19, 15, -5, -5, 15, 19, 4,
+            -18, -5, -27, -22, -22, -27, -5, -18
+        },
+        // Knight, middlegame
+        {
+            -80, -188, -162, -114, -114, -162, -188, -80,
+            -18, -13, 43, 22, 22, 43, -13, -18,
+            -1, 11, 45, 43, 43, 45, 11, -1,
+            0, -9, 21, 23, 23, 21, -9, 0,
+            -20, -5, -3, 2, 2, -3, -5, -20,
+            -40, -25, -20, -10, -10, -20, -25, -40,
+            -32, -36, -26, -19, -19, -26, -36, -32,
+            -82, -50, -53, -49, -49, -53, -50, -82
+        },
+        // Rook, middlegame
+        {
+            -11, 7, -11, -2, 2, 33, 44, 58,
+            -46, -40, -43, -18, -56, -14, -13, 46,
+            -52, -21, -47, -29, -28, -9, 46, -1,
+            -44, -17, -37, -15, -34, -20, -17, -12,
+            -76, -57, -74, -53, -69, -72, -54, -66,
+            -91, -60, -82, -73, -85, -75, -44, -60,
+            -101, -70, -84, -77, -92, -75, -59, -100,
+            -79, -60, -78, -53, -76, -72, -81, -102
+        },
+        // Queen, middlegame
+        {
+            -67, -28, 17, 8, 8, 17, -28, -67,
+            -7, -88, -48, -105, -105, -48, -88, -7,
+            -39, -37, -30, -47, -47, -30, -37, -39,
+            -29, -44, -29, -40, -40, -29, -44, -29,
+            -49, -61, -52, -55, -55, -52, -61, -49,
+            -60, -62, -62, -67, -67, -62, -62, -60,
+            -40, -57, -41, -51, -51, -41, -57, -40,
+            -89, -101, -75, -65, -65, -75, -101, -89
+        },
+        // King, middlegame
+        {
+            257, 189, 229, 192, 196, 227, 217, 247,
+            66, -2, 38, 1, 5, 36, 26, 56,
+            -49, -117, -77, -114, -110, -79, -89, -59,
+            24, -44, -4, -41, -37, -6, -16, 14,
+            -14, -82, -42, -79, -75, -44, -54, -24,
+            25, -43, -3, -15, -11, -5, -15, 15,
+            74, 31, 21, 9, 13, 19, 59, 64,
+            86, 68, 58, 21, 25, 56, 96, 76
+        },
+        // Pawn, endgame
+        {
+            -90, -90, -90, -90, -90, -90, -90, -90,
+            67, 60, 56, 2, 2, 10, 66, 86,
+            18, 22, -10, -34, -39, -57, -14, 1,
+            -45, -56, -76, -89, -91, -94, -78, -59,
+            -67, -70, -88, -94, -90, -94, -85, -74,
+            -77, -75, -93, -82, -82, -91, -85, -80,
+            -68, -66, -75, -69, -64, -78, -81, -77,
+            -90, -90, -90, -90, -90, -90, -90, -90
+        },
+        // Bishop, endgame
+        {
+            13, 30, 36, 80, 80, 36, 30, 13,
+            -5, 56, 35, 69, 69, 35, 56, -5,
+            45, -1, 35, 24, 24, 35, -1, 45,
+            8, 59, 26, 69, 69, 26, 59, 8,
+            -6, 43, 71, 58, 58, 71, 43, -6,
+            -9, 15, 42, 61, 61, 42, 15, -9,
+            -28, -3, -7, 48, 48, -7, -3, -28,
+            -37, 6, -4, 46, 46, -4, 6, -37
+        },
+        // Knight, endgame
+        {
+            -43, 38, 37, 49, 49, 37, 38, -43,
+            34, 46, 33, 59, 59, 33, 46, 34,
+            28, 35, 48, 58, 58, 48, 35, 28,
+            49, 74, 79, 98, 98, 79, 74, 49,
+            62, 66, 87, 106, 106, 87, 66, 62,
+            44, 56, 63, 97, 97, 63, 56, 44,
+            30, 36, 44, 55, 55, 44, 36, 30,
+            8, -20, 23, 37, 37, 23, -20, 8
+        },
+        // Rook, endgame
+        {
+            16, 12, 32, 43, 43, 32, 12, 16,
+            -10, 56, 58, 53, 53, 58, 56, -10,
+            43, 23, 35, 46, 46, 35, 23, 43,
+            32, 10, 24, 27, 27, 24, 10, 32,
+            27, 11, 35, 28, 28, 35, 11, 27,
+            16, -18, 12, 39, 39, 12, -18, 16,
+            19, -25, 1, 16, 16, 1, -25, 19,
+            -36, 4, 18, 21, 21, 18, 4, -36
+        },
+        // Queen, endgame
+        {
+            6, 26, -5, 21, 21, -5, 26, 6,
+            36, 129, 90, 147, 147, 90, 129, 36,
+            27, 64, 61, 105, 105, 61, 64, 27,
+            9, 65, 32, 82, 82, 32, 65, 9,
+            -1, 53, 16, 62, 62, 16, 53, -1,
+            -12, 26, 12, 36, 36, 12, 26, -12,
+            -71, -16, -53, -5, -5, -53, -16, -71,
+            -50, -12, -41, -18, -18, -41, -12, -50
+        },
+        // King, endgame
+        {
+            -28, 16, 26, 42, 45, 16, 7, -14,
+            8, 53, 63, 78, 81, 53, 44, 22,
+            -31, 36, 91, 106, 109, 81, 27, -17,
+            -72, -5, 72, 87, 90, 62, -14, -58,
+            -80, -13, 64, 79, 82, 54, -22, -66,
+            -79, -12, 43, 58, 61, 33, -21, -65,
+            -61, -39, 16, 9, 12, 6, -48, -47,
+            -109, -43, -55, -62, -59, -65, -52, -95
+        }
+    };
 
     [[nodiscard]]
     static constexpr inline int PstMg(int pieceTypeIdx, int sq, bool isBlack) noexcept {
@@ -1329,16 +1479,6 @@ namespace PieceSquareTables {
     [[nodiscard]]
     static constexpr inline int PstEg(int pieceTypeIdx, int sq, bool isBlack) noexcept {
         return Table[pieceTypeIdx + 6][isBlack ? Utils::Mirror(sq) : sq];
-    }
-
-    [[nodiscard]]
-    static constexpr inline int GetPSTScore(int pieceTypeIdx, int sq, bool isBlack, float endgameWeight) noexcept {
-        if (isBlack) sq = Utils::Mirror(sq);
-
-        const int early = Table[pieceTypeIdx][sq];
-        const int end = Table[pieceTypeIdx + 6][sq];
-
-        return Utils::IntLerp(early, end, endgameWeight);
     }
 }
 
@@ -1353,8 +1493,9 @@ namespace IncrementalEval {
         const int t = static_cast<int>(type);
         const int s = black ? -sign : sign;
 
-        mg += s * (PieceValues[t] + PieceSquareTables::PstMg(t, sq, black));
-        eg += s * (PieceEgValues[t] + PieceSquareTables::PstEg(t, sq, black));
+        mg += s * (PieceValue[t].mg + PieceSquareTables::PstMg(t, sq, black));
+        eg += s * (PieceValue[t].eg + PieceSquareTables::PstEg(t, sq, black));
+
         phase += sign * PhaseWeight[t];
     }
 }
@@ -2634,61 +2775,78 @@ float Board::getEndgameWeight() const {
 
 namespace {
 
-    struct Score {
-        int mg{0};
-        int eg{0};
-
-        constexpr Score() = default;
-        constexpr Score(int m, int e) : mg(m), eg(e) {}
-
-        constexpr Score& operator+=(const Score& o) noexcept {
-            mg += o.mg; eg += o.eg; return *this;
-        }
-        constexpr Score& operator-=(const Score& o) noexcept {
-            mg -= o.mg; eg -= o.eg; return *this;
-        }
-    };
-
-    constexpr Score operator+(Score a, const Score& b) noexcept {
-        return a += b;
-    }
-    constexpr Score operator-(Score a, const Score& b) noexcept {
-        return a -= b;
-    }
-    constexpr Score operator*(const Score& a, int k) noexcept {
-        return Score(a.mg * k, a.eg * k);
-    }
-
-    [[nodiscard]]
-    constexpr inline int ChebDist(int a, int b) noexcept {
-        return std::max(std::abs(ToRank(a) - ToRank(b)), std::abs(ToFile(a) - ToFile(b)));
-    }
-
-    [[nodiscard]]
-    constexpr inline int ManhattanDist(int a, int b) noexcept {
-        return std::abs(ToRank(a) - ToRank(b)) + std::abs(ToFile(a) - ToFile(b));
-    }
-
     constexpr uint64_t FileA = 0x0101010101010101ull;
     constexpr uint64_t FileH = 0x8080808080808080ull;
 
-    // indexed by how far the pawn has advanced (1 = on its starting rank, 6 = one step from promotion)
-    constexpr Score SupportedPawn[8] = {{0, 0}, {0, 0}, {4, 4}, {6, 7}, {10, 12}, {18, 22}, {30, 40}, {0, 0}};
-    constexpr Score PhalanxPawn[8] = {{0, 0}, {3, 2}, {5, 4}, {8, 7}, {13, 12}, {22, 24}, {34, 38}, {0, 0}};
+    constexpr uint64_t LightSquaresMask = 0xAA55AA55AA55AA55ull;
+    constexpr uint64_t CenterFilesMask = 0x3C3C3C3C3C3C3C3Cull;
+    constexpr uint64_t CenterSquares = (1ull << 27) | (1ull << 28) | (1ull << 35) | (1ull << 36); // d5 e5 d4 e4
 
-    constexpr int AttackerCountScaleOld[] = {0, 0, 50, 75, 88, 94, 97, 99, 100};
-    constexpr int AttackerCountScaleNew[] = {0, 40, 70, 90, 100, 100, 100, 100, 100};
+    constexpr uint64_t OutpostRanks[2] = {0x000000FFFFFF0000ull, 0x0000FFFFFF000000ull};
+    constexpr uint64_t KingCamp[2] = {~0x0000000000FFFFFFull, 0x000000FFFFFFFFFFull};
+    constexpr uint64_t KingFlank[8] = {
+        0x0707070707070707ull, 0x0F0F0F0F0F0F0F0Full, 0x0F0F0F0F0F0F0F0Full, 0x3C3C3C3C3C3C3C3Cull,
+        0x3C3C3C3C3C3C3C3Cull, 0xF0F0F0F0F0F0F0F0ull, 0xF0F0F0F0F0F0F0F0ull, 0xE0E0E0E0E0E0E0E0ull
+    };
 
-    // non-pawn material in centipawns on a "textbook" scale, only used for deciding what is winning / drawn
+    [[nodiscard]]
+    inline Score MobilityScore(int pt, int n) noexcept {
+        switch (pt) {
+        case 0: return KnightMobility[n];
+        case 1: return BishopMobility[n];
+        case 2: return RookMobility[n];
+        default: return QueenMobility[n];
+        }
+    }
+
     [[nodiscard]]
     inline int NonPawnMaterial(const uint64_t* pm, int c) noexcept {
-        return 300 * (NumBitsOn(pm[c * 6 + 1]) + NumBitsOn(pm[c * 6 + 2])) +
-            500 * NumBitsOn(pm[c * 6 + 3]) + 900 * NumBitsOn(pm[c * 6 + 4]);
+        return (
+            300 * (NumBitsOn(pm[c * 6 + 1]) + NumBitsOn(pm[c * 6 + 2])) +
+            500 * NumBitsOn(pm[c * 6 + 3]) + 900 * NumBitsOn(pm[c * 6 + 4])
+        );
     }
 
     [[nodiscard]]
     constexpr inline bool IsLightSquare(int sq) noexcept {
         return ((ToRank(sq) + ToFile(sq)) & 1) == 0;
+    }
+
+    [[nodiscard]]
+    constexpr inline int Advance(int c, int sq) noexcept {
+        return c ? ToRank(sq) : (Ranks - 1 - ToRank(sq));
+    }
+
+    [[nodiscard]]
+    constexpr inline uint64_t Forward(int c, uint64_t bb) noexcept {
+        return c ? (bb << 8) : (bb >> 8);
+    }
+
+    [[nodiscard]]
+    constexpr inline uint64_t ForwardFill(int c, uint64_t b) noexcept {
+        if (c) {
+            b |= b << 8; b |= b << 16; b |= b << 32;
+        } else {
+            b |= b >> 8; b |= b >> 16; b |= b >> 32;
+        }
+
+        return b;
+    }
+
+    [[nodiscard]]
+    constexpr inline uint64_t PawnAttacksBB(int c, uint64_t pawns) noexcept {
+        return (
+            c ? (((pawns & ~FileA) << 7) | ((pawns & ~FileH) << 9))
+            : (((pawns & ~FileA) >> 9) | ((pawns & ~FileH) >> 7))
+        );
+    }
+
+    [[nodiscard]]
+    constexpr inline uint64_t PawnDoubleAttacksBB(int c, uint64_t pawns) noexcept {
+        return (
+            c ? (((pawns & ~FileA) << 7) & ((pawns & ~FileH) << 9))
+            : (((pawns & ~FileA) >> 9) & ((pawns & ~FileH) >> 7))
+        );
     }
 
     Score EvalPawnsAndKing(const Board& b, int c, uint64_t& passedOut) noexcept {
@@ -2713,10 +2871,7 @@ namespace {
             ++fileCounts[f];
 
             // material + piece square table
-            s += Score(
-                PieceValues[0] + PieceSquareTables::PstMg(0, sq, black),
-                PieceEgValues[0] + PieceSquareTables::PstEg(0, sq, black)
-            );
+            s += PieceValue[0] + Score(PieceSquareTables::PstMg(0, sq, black), PieceSquareTables::PstEg(0, sq, black));
 
             const bool isPassed = !(LUTs::PassedPawn[c][sq] & enemyPawns);
             if (isPassed) {
@@ -2735,20 +2890,32 @@ namespace {
             const bool phalanx = (sameRankNeighbours & pawns) != 0;
 
             if (isolated) {
-                s += Score(-14, -18);
-                if (!opposed) s += Score(-8, -4); // isolated on a half open file is a target
+                s += Isolated;
+                if (!opposed) s += IsolatedOpen; // isolated on a half open file is a target
             } else if (!(LUTs::BackSupport[c][sq] & pawns)) {
                 const int stop = sq + (black ? Files : -Files);
                 if (LUTs::PawnAttacks[c][stop] & enemyPawns) {
-                    s += Score(-9, -12);
-                    if (!opposed) s += Score(-8, -4);
+                    s += Backward;
+                    if (!opposed) s += BackwardOpen;
                 }
             }
 
-            if (supported) s += SupportedPawn[adv];
-            if (phalanx) s += PhalanxPawn[adv];
-        }
+            if (supported) s += Supported[adv];
+            if (phalanx) s += Phalanx[adv];
 
+            {
+                // a pawn that is not passed yet, but has at least as many helpers as there are enemy
+                // pawns that could stop it, so a pawn break can turn it into a passer
+                if (!isPassed && !opposed && adv >= 3) {
+                    const int sentries = NumBitsOn(LUTs::PassedPawn[c][sq] & LUTs::AdjacentFiles[f] & enemyPawns);
+                    const int helpers = NumBitsOn(LUTs::BackSupport[c][sq] & pawns);
+
+                    if (sentries >= 1 && helpers >= sentries) s += Candidate[adv];
+                }
+            }
+
+            if (isPassed) s += PassedFile[f];
+        }
 
         for (int f = 0; f < Files; ++f) {
             const int count = fileCounts[f];
@@ -2758,7 +2925,7 @@ namespace {
             const int passedDoubled = std::min(doubled, passedOnFile[f]);
             const int normalDoubled = doubled - passedDoubled;
 
-            s -= Score(12, 18) * normalDoubled + Score(6, 10) * passedDoubled;
+            s += Doubled * normalDoubled + DoubledPassed * passedDoubled;
         }
 
         // connected passed pawns
@@ -2767,7 +2934,7 @@ namespace {
             const bool leftPassed = (f > 0) && passedOnFile[f - 1];
             const bool rightPassed = (f < Files - 1) && passedOnFile[f + 1];
 
-            if (leftPassed || rightPassed) s += Score(0, 30);
+            if (leftPassed || rightPassed) s += ConnectedPassers;
         }
 
         /* king: piece square table + pawn shield + open files in front of it */ {
@@ -2778,12 +2945,12 @@ namespace {
             const int missing1 = NumBitsOn(LUTs::PawnShield[c][kingSq] & ~pawns);
             const int missing2 = NumBitsOn(LUTs::PawnShield2[c][kingSq] & ~pawns);
 
-            s -= Score(missing1 * 20 + missing2 * 10, 0);
+            s += ShieldMissing1 * missing1 + ShieldMissing2 * missing2;
 
             const int kf = ToFile(kingSq);
             for (int f = std::max(0, kf - 1); f <= std::min(Files - 1, kf + 1); ++f) {
                 const uint64_t fm = Utils::FileMask(f);
-                if (!(fm & pawns)) s -= Score((fm & enemyPawns) ? 10 : 16, 0);
+                if (!(fm & pawns)) s += (fm & enemyPawns) ? KingFileSemi : KingFileOpen;
             }
         }
 
@@ -2804,7 +2971,18 @@ namespace {
         return entry;
     }
 
-    Score EvalPassers(const Board& b, int c, uint64_t passed, uint64_t occ, bool enemyToMove) noexcept {
+    struct AttackMaps {
+        // squares attacked by a piece type of a color
+        uint64_t byPiece[2][6]{};
+        // squares attacked by anything of a color
+        uint64_t all[2]{};
+        // squares attacked at least twice by a color
+        uint64_t twice[2]{};
+    };
+
+    Score EvalPassers(
+        const Board& b, int c, uint64_t passed, uint64_t occ, bool enemyToMove, const AttackMaps& am
+    ) noexcept {
         if (!passed) return Score();
 
         const bool black = c == 1;
@@ -2817,6 +2995,10 @@ namespace {
         // the enemy has only a king + pawns, so only his king can stop a passed pawn
         const bool onlyKingDefends = !(pm[e * 6 + 1] | pm[e * 6 + 2] | pm[e * 6 + 3] | pm[e * 6 + 4]);
 
+        const uint64_t ownOcc = b.GetOccupancyMap(static_cast<PieceColor>(c));
+        const uint64_t enemyOcc = b.GetOccupancyMap(static_cast<PieceColor>(e));
+        const uint64_t rooksAndQueens = pm[3] | pm[4] | pm[9] | pm[10];
+
         Score s;
 
         for (uint64_t tmp = passed; tmp; tmp &= tmp - 1) {
@@ -2825,17 +3007,15 @@ namespace {
             const int r = ToRank(sq);
             const int adv = black ? r : (Ranks - 1 - r);
 
-            const int base = 5 * adv * adv;
-
             const uint64_t front = LUTs::PassedPawn[c][sq] & Utils::FileMask(f);
             const int stop = sq + (black ? Files : -Files);
 
             // reduce bonus if a piece is blocking the promotion path, a lot more if it is the stop square
             int pct = 100;
-            if (occ & IndexToMask(stop)) pct = 40;
-            else if (front & occ) pct = 70;
+            if (occ & IndexToMask(stop)) pct = PassedBlockedPct;
+            else if (front & occ) pct = PassedBehindPct;
 
-            s += Score(base * pct / 100, 2 * base * pct / 100);
+            s += Score(PassedBase[adv].mg * pct / 100, PassedBase[adv].eg * pct / 100);
 
             // king proximity to the stop square: the enemy king being far / our king being close matters
             // more the further the pawn has advanced
@@ -2844,7 +3024,28 @@ namespace {
                 const int oppD = ChebDist(oppKing, stop);
                 const int ownD = ChebDist(ownKing, stop);
 
-                s += Score(0, ((oppD * 19 / 4 - ownD * 2) * w) / 4);
+                s += Score(0, ((oppD * KingProxOpp / 4 - ownD * KingProxOwn) * w) / 4);
+
+                {
+                    // free to advance: nothing on the stop square and, the fewer enemy attackers / pieces
+                    // there are on the way to the queening square, the better. Enemy rooks / queens behind the
+                    // pawn x-ray the whole path
+                    const uint64_t stopMask = IndexToMask(stop);
+
+                    if (!(occ & stopMask)) {
+                        const uint64_t behind = LUTs::PassedPawn[e][sq] & Utils::FileMask(f);
+
+                        uint64_t unsafe = LUTs::PassedPawn[c][sq];
+                        if (!(enemyOcc & behind & rooksAndQueens)) unsafe &= am.all[e] | enemyOcc;
+
+                        int k = !unsafe ? PathFree : !(unsafe & front) ? PathClear : !(unsafe & stopMask) ? PathStop : 0;
+
+                        // our own rook / queen behind the pawn, or the stop square is covered
+                        if ((ownOcc & behind & rooksAndQueens) || (am.all[c] & stopMask)) k += PathDefended;
+
+                        s += Score(k * w / PathDiv, k * w / PathDiv);
+                    }
+                }
             }
 
             // rule of the square: nothing but the enemy king can stop the pawn and it is out of reach
@@ -2855,32 +3056,42 @@ namespace {
                 const int promoSq = black ? (Ranks * (Ranks - 1) + f) : f;
                 const int kingDist = ChebDist(oppKing, promoSq) - (enemyToMove ? 1 : 0);
 
-                if (kingDist > steps) s += Score(0, 400);
+                if (kingDist > steps) s += Score(0, UnstoppableEg);
             }
         }
 
         return s;
     }
 
-    struct AttackMaps {
-        uint64_t byPiece[2][6]{};
-        uint64_t all[2]{};
-    };
-
-    Score EvalPieces(const Board& b, uint64_t occW, uint64_t occB, uint64_t occ) noexcept {
+    Score EvalPieces(
+        const Board& b, uint64_t occW, uint64_t occB, uint64_t occ, const uint64_t* passed, AttackMaps& am
+    ) noexcept {
         const uint64_t* pm = b.GetPieceMasks();
         const uint64_t colorOcc[2] = {occW, occB};
-
-        AttackMaps am;
+        const uint64_t allPawns = pm[0] | pm[6];
 
         am.byPiece[0][0] = ((pm[0] & ~FileA) >> 9) | ((pm[0] & ~FileH) >> 7);
         am.byPiece[1][0] = ((pm[6] & ~FileA) << 7) | ((pm[6] & ~FileH) << 9);
 
         int kingSq[2];
+        // running union of everything attacked so far by a color
+        uint64_t running[2];
+
         for (int c = 0; c < 2; ++c) {
             kingSq[c] = MaskToIndex(pm[c * 6 + 5]);
             am.byPiece[c][5] = LUTs::KingAttacks[kingSq[c]];
+
+            running[c] = am.byPiece[c][0] | am.byPiece[c][5];
+            am.twice[c] = (am.byPiece[c][0] & am.byPiece[c][5]) | PawnDoubleAttacksBB(c, pm[c * 6]);
         }
+
+        // every square an enemy pawn could ever attack
+        const uint64_t pawnSpan[2] = {ForwardFill(0, am.byPiece[0][0]), ForwardFill(1, am.byPiece[1][0])};
+        // pawns with something directly in front of them
+        const uint64_t blockedPawns[2] = {pm[0] & (occ << 8), pm[6] & (occ >> 8)};
+
+        // squares that count for mobility: not our own pieces, not controlled by an enemy pawn
+        uint64_t mobilityArea[2];
 
         // king attack bookkeeping, indexed by the side whose king is being attacked
         int attackers[2] = {};
@@ -2890,20 +3101,28 @@ namespace {
         Score total;
 
         for (int c = 0; c < 2; ++c) {
-            const bool black = c == 1;
             const int off = c * 6;
             const int e = c ^ 1;
             const uint64_t myOcc = colorOcc[c];
             const uint64_t enemyPawnAttacks = am.byPiece[e][0];
 
-            // squares that count for mobility: not our own pieces, not controlled by an enemy pawn
             const uint64_t area = ~myOcc & ~enemyPawnAttacks;
+            mobilityArea[c] = area;
 
             const uint64_t zone = LUTs::KingZone[e][kingSq[e]];
 
             const uint64_t forkTargets = pm[e * 6 + 3] | pm[e * 6 + 4] | pm[e * 6 + 5];
 
+            // squares in the enemy half, defended by one of our pawns, that no enemy pawn can ever attack
+            const uint64_t outposts = OutpostRanks[c] & am.byPiece[c][0] & ~pawnSpan[e];
+
             Score s;
+
+            const auto addAttacks = [&](int pt, uint64_t atk) {
+                am.byPiece[c][pt] |= atk;
+                am.twice[c] |= running[c] & atk;
+                running[c] |= atk;
+                };
 
             const auto noteZone = [&](uint64_t atk, int weight) {
                 if (atk & zone) {
@@ -2913,75 +3132,109 @@ namespace {
                 }
                 };
 
+            // terms shared by bishops and knights
+            const auto minorTerms = [&](int sq, uint64_t atk, bool bishop) {
+                const uint64_t sqMask = IndexToMask(sq);
+
+                if (outposts & sqMask) s += bishop ? BishopOutpost : KnightOutpost;
+                else if (outposts & atk & ~myOcc) s += bishop ? BishopReach : KnightReach;
+
+                {
+                    // sitting right behind a pawn is safe
+                    if (Forward(c, sqMask) & allPawns) s += MinorBehind;
+
+                    // minor pieces should stay close to their own king
+                    s += KingProtector * ChebDist(sq, kingSq[c]);
+                }
+                };
+
             // bishops
             for (uint64_t tmp = pm[off + 1]; tmp; tmp &= tmp - 1) {
                 const int sq = MaskToIndex(tmp);
                 const uint64_t atk = MagicBitboard::DiagonalAttacks(sq, occ);
-                am.byPiece[c][1] |= atk;
+                addAttacks(1, atk);
 
-                const int mob = LUTs::BishopMobilityScore[NumBitsOn(atk & area)];
-                s += Score(mob, mob);
+                s += MobilityScore(1, NumBitsOn(atk & area));
 
-                noteZone(atk, 20);
+                noteZone(atk, UnitBishop);
+
+                {
+                    minorTerms(sq, atk, true);
+
+                    // bad bishop: our pawns on its color, much worse when the central ones are blocked
+                    const int sameColor = NumBitsOn(pm[off] & (IsLightSquare(sq) ? LightSquaresMask : ~LightSquaresMask));
+                    s += BadBishop * (sameColor * (1 + NumBitsOn(blockedPawns[c] & CenterFilesMask)));
+
+                    // long diagonal bishop that sees both central squares through the pawns
+                    if (NumBitsOn(MagicBitboard::DiagonalAttacks(sq, allPawns) & CenterSquares) >= 2) s += LongDiagonal;
+                }
             }
 
-            if (NumBitsOn(pm[off + 1]) >= 2) s += Score(30, 30); // bishop pair
+            if (NumBitsOn(pm[off + 1]) >= 2) s += BishopPair;
 
             // knights
             for (uint64_t tmp = pm[off + 2]; tmp; tmp &= tmp - 1) {
                 const int sq = MaskToIndex(tmp);
                 const uint64_t atk = LUTs::KnightAttacks[sq];
-                am.byPiece[c][2] |= atk;
+                addAttacks(2, atk);
 
-                const int mob = LUTs::KnightMobilityScore[NumBitsOn(atk & area)];
-                s += Score(mob, mob);
+                s += MobilityScore(0, NumBitsOn(atk & area));
 
-                if (NumBitsOn(atk & forkTargets) >= 2 && !(enemyPawnAttacks & IndexToMask(sq))) s += Score(40, 40);
+                if (NumBitsOn(atk & forkTargets) >= 2 && !(enemyPawnAttacks & IndexToMask(sq))) s += KnightFork;
 
-                // outpost: on the enemy half, protected by a pawn and no enemy pawn can ever kick it
-                {
-                    const int adv = black ? ToRank(sq) : (Ranks - 1 - ToRank(sq));
-                    if (
-                        adv >= 3 && adv <= 5 &&
-                        (LUTs::PawnAttacks[e][sq] & pm[off]) &&
-                        !(LUTs::PassedPawn[c][sq] & LUTs::AdjacentFiles[ToFile(sq)] & pm[e * 6])
-                    ) {
-                        s += Score(22, 14);
-                    }
-                }
+                minorTerms(sq, atk, false);
 
-                noteZone(atk, 20);
+                noteZone(atk, UnitKnight);
             }
 
             // rooks
             for (uint64_t tmp = pm[off + 3]; tmp; tmp &= tmp - 1) {
                 const int sq = MaskToIndex(tmp);
                 const uint64_t atk = MagicBitboard::OrthogonalAttacks(sq, occ);
-                am.byPiece[c][3] |= atk;
+                addAttacks(3, atk);
 
-                const int mob = LUTs::RookMobilityScore[NumBitsOn(atk & area)];
-                s += Score(mob, mob);
+                const int n = NumBitsOn(atk & area);
+                s += MobilityScore(2, n);
 
                 // open / semi open file
                 const uint64_t file = Utils::FileMask(ToFile(sq));
                 const bool noMine = !(file & pm[off]);
                 const bool noOpp = !(file & pm[e * 6]);
-                if (noMine && noOpp) s += Score(20, 20);
-                else if (noMine) s += Score(10, 10);
+                if (noMine && noOpp) s += RookOpen;
+                else if (noMine) s += RookSemi;
 
-                noteZone(atk, 40);
+                {
+                    // locked in by its own king: worse when we can not castle any more
+                    if (!noMine && n <= 3) {
+                        const int kf = ToFile(kingSq[c]);
+                        if ((kf < 4) == (ToFile(sq) < kf)) {
+                            const bool canCastle = ((b.GetCastlingRights() >> (2 * c)) & 3) != 0;
+                            s += TrappedRook * (canCastle ? 1 : 2);
+                        }
+                    }
+
+                    // a rook on the 5th rank or beyond that eyes enemy pawns
+                    if (Advance(c, sq) >= 4) {
+                        s += RookOnPawn * NumBitsOn(pm[e * 6] & MagicBitboard::OrthogonalAttacks(sq, 0ull));
+                    }
+
+                    // behind our own passed pawn
+                    if (passed[c] & LUTs::PassedPawn[c][sq] & file) s += RookBehindPasser;
+                }
+
+                noteZone(atk, UnitRook);
             }
 
             // queens
             for (uint64_t tmp = pm[off + 4]; tmp; tmp &= tmp - 1) {
                 const int sq = MaskToIndex(tmp);
                 const uint64_t atk = MagicBitboard::CombinedAttacks(sq, occ);
-                am.byPiece[c][4] |= atk;
+                addAttacks(4, atk);
 
-                const int mob = LUTs::QueenMobilityScore[NumBitsOn(atk & area)];
-                s += Score(mob, mob);
+                s += MobilityScore(3, NumBitsOn(atk & area));
 
-                noteZone(atk, 80);
+
+                noteZone(atk, UnitQueen);
             }
 
             if (c == 0) total += s;
@@ -2993,7 +3246,8 @@ namespace {
                 am.byPiece[c][3] | am.byPiece[c][4] | am.byPiece[c][5];
         }
 
-        // ---- king danger and threats, from the point of view of the attacking side c ----
+
+        // ---- king danger, threats and space, from the point of view of the attacking side c ----
         for (int c = 0; c < 2; ++c) {
             const int e = c ^ 1;
             const int off = c * 6;
@@ -3010,18 +3264,37 @@ namespace {
                 const uint64_t bishopChecks = MagicBitboard::DiagonalAttacks(kingSq[e], occ);
                 const uint64_t rookChecks = MagicBitboard::OrthogonalAttacks(kingSq[e], occ);
 
-                if (am.byPiece[c][2] & knightChecks & safe) units[e] += 30;
-                if (am.byPiece[c][1] & bishopChecks & safe) units[e] += 20;
-                if (am.byPiece[c][3] & rookChecks & safe) units[e] += 40;
-                if (am.byPiece[c][4] & (bishopChecks | rookChecks) & safe) units[e] += 50;
+                if (am.byPiece[c][2] & knightChecks & safe) units[e] += CheckKnight;
+                if (am.byPiece[c][1] & bishopChecks & safe) units[e] += CheckBishop;
+                if (am.byPiece[c][3] & rookChecks & safe) units[e] += CheckRook;
+                if (am.byPiece[c][4] & (bishopChecks | rookChecks) & safe) units[e] += CheckQueen;
+
+                {
+                    // squares next to the king that we hit and the defender barely covers (only by his king or
+                    // queen, and not twice)
+                    const uint64_t zone = LUTs::KingZone[e][kingSq[e]];
+                    const uint64_t weakRing =
+                        zone & am.all[c] & ~am.twice[e] & (~am.all[e] | am.byPiece[e][5] | am.byPiece[e][4]);
+
+                    units[e] += WeakRingUnit * NumBitsOn(weakRing);
+
+                    // a knight / bishop that covers the squares around the king takes the sting out of attacks
+                    if (am.byPiece[e][2] & am.byPiece[e][5]) units[e] += KnightDefUnit;
+                    if (am.byPiece[e][1] & am.byPiece[e][5]) units[e] += BishopDefUnit;
+
+                    // attacks on the flank the king lives on, in the defender's half of the board
+                    const uint64_t flank = am.all[c] & KingFlank[ToFile(kingSq[e])] & KingCamp[e];
+                    const int flankAttacks = NumBitsOn(flank) + NumBitsOn(flank & am.twice[c]);
+                    s += FlankAttack * flankAttacks;
+                }
             }
 
-            int danger = units[e] * AttackerCountScaleNew[std::min(attackers[e], 8)] / 100 + zoneHits[e] * 2;
+            int danger = units[e] * AttackerScale[std::min(attackers[e], 8)] / 100 + zoneHits[e] * ZoneHitUnit;
 
             // without a queen an attack on the king is much less dangerous
-            if (!pm[off + 4]) danger /= 2;
+            if (!pm[off + 4]) danger = danger * QueenlessPct / 100;
 
-            danger = std::min(danger, 300);
+            danger = std::clamp(danger, 0, DangerCap);
 
             total += (c == 0) ? Score(danger, 0) : Score(-danger, 0);
 
@@ -3035,19 +3308,72 @@ namespace {
                 const uint64_t rookAtk = am.byPiece[c][3];
 
                 // pawns attacking pieces
-                s += Score(25, 15) * NumBitsOn(pawnAtk & eMinors);
-                s += Score(35, 20) * NumBitsOn(pawnAtk & eRooks);
-                s += Score(40, 20) * NumBitsOn(pawnAtk & eQueens);
+                s += PawnAttackMinor * NumBitsOn(pawnAtk & eMinors);
+                s += PawnAttackRook * NumBitsOn(pawnAtk & eRooks);
+                s += PawnAttackQueen * NumBitsOn(pawnAtk & eQueens);
 
                 // minors attacking rooks / queens, rooks attacking queens
-                s += Score(25, 15) * NumBitsOn(minorAtk & eRooks);
-                s += Score(30, 15) * NumBitsOn(minorAtk & eQueens);
-                s += Score(25, 15) * NumBitsOn(rookAtk & eQueens);
+                s += MinorAttackRook * NumBitsOn(minorAtk & eRooks);
+                s += MinorAttackQueen * NumBitsOn(minorAtk & eQueens);
+                s += RookAttackQueen * NumBitsOn(rookAtk & eQueens);
 
-                // pieces that are attacked and not defended at all
                 const uint64_t ePieces = eMinors | eRooks | eQueens;
-                s += Score(10, 6) * NumBitsOn(am.all[c] & ePieces & ~am.all[e]);
+
+                {
+                    // pieces (and pawns) of the enemy that are attacked by us and are not "strongly protected":
+                    // protected by a pawn, or defended twice while we do not attack twice
+                    const uint64_t eNoKing = colorOcc[e] & ~pm[eoff + 5];
+                    const uint64_t stronglyProtected = am.byPiece[e][0] | (am.twice[e] & ~am.twice[c]);
+                    const uint64_t weak = eNoKing & ~stronglyProtected & am.all[c];
+
+                    // minors hitting weak pieces (the existing terms above already cover rooks / queens)
+                    uint64_t t = weak & minorAtk;
+                    s += WeakPawnByMinor * NumBitsOn(t & pm[eoff]);
+                    s += WeakKnightByMinor * NumBitsOn(t & pm[eoff + 2]);
+                    s += WeakBishopByMinor * NumBitsOn(t & pm[eoff + 1]);
+
+                    // rooks hitting weak pieces
+                    t = weak & rookAtk;
+                    s += WeakPawnByRook * NumBitsOn(t & pm[eoff]);
+                    s += WeakMinorByRook * NumBitsOn(t & eMinors);
+                    s += WeakRookByRook * NumBitsOn(t & eRooks);
+
+                    // our king can take a weak piece
+                    if (weak & am.byPiece[c][5]) s += KingThreat;
+
+                    // hanging: weak and not defended at all, or attacked twice with a non pawn target
+                    const uint64_t hanging = weak & (~am.all[e] | (ePieces & am.twice[c]));
+                    s += HangingPiece * NumBitsOn(hanging & ePieces);
+                    s += HangingPawn * NumBitsOn(hanging & pm[eoff]);
+
+                    // restricting enemy pieces
+                    s += Restricted * NumBitsOn(am.all[e] & ~stronglyProtected & am.all[c]);
+
+                    // safe pawn pushes that would attack something valuable
+                    {
+                        uint64_t push = Forward(c, pm[off]) & ~occ;
+                        push |= Forward(c, push & (c ? 0x0000000000FF0000ull : 0x0000FF0000000000ull)) & ~occ;
+                        push &= ~am.byPiece[e][0] & (~am.all[e] | am.all[c]);
+
+                        s += PawnPush * NumBitsOn(PawnAttacksBB(c, push) & ePieces);
+                    }
+
+                    // knights / sliders that could hit the queen next move
+                    if (NumBitsOn(eQueens) == 1) {
+                        const int qs = MaskToIndex(eQueens);
+                        const uint64_t safeSq = mobilityArea[c] & ~stronglyProtected;
+
+                        s += KnightOnQueen * NumBitsOn(am.byPiece[c][2] & LUTs::KnightAttacks[qs] & safeSq);
+
+                        const uint64_t sliders =
+                            (am.byPiece[c][1] & MagicBitboard::DiagonalAttacks(qs, occ)) |
+                            (am.byPiece[c][3] & MagicBitboard::OrthogonalAttacks(qs, occ));
+
+                        s += SliderOnQueen * NumBitsOn(sliders & safeSq & am.twice[c]);
+                    }
+                }
             }
+
 
             if (c == 0) total += s;
             else total -= s;
@@ -3083,31 +3409,42 @@ int Board::evaluate(PieceColor sideToMove, float endgameWeight) const noexcept {
     const bool whiteToMove = sideToMove == PieceColor::White;
 
     Score total(pawnData.Mg + m_IncMg, pawnData.Eg + m_IncEg);
-    total += EvalPieces(*this, occW, occB, occ);
-    total += EvalPassers(*this, 0, pawnData.Passed[0], occ, !whiteToMove);
-    total -= EvalPassers(*this, 1, pawnData.Passed[1], occ, whiteToMove);
 
-    // interpolate between middlegame and endgame once
-    int v = static_cast<int>(static_cast<float>(total.mg) + static_cast<float>(total.eg - total.mg) * endgameWeight);
+    AttackMaps am;
+    total += EvalPieces(*this, occW, occB, occ, pawnData.Passed, am);
+    total += EvalPassers(*this, 0, pawnData.Passed[0], occ, !whiteToMove, am);
+    total -= EvalPassers(*this, 1, pawnData.Passed[1], occ, whiteToMove, am);
 
-    // endgame scaling: some material advantages do not win
-    if (v != 0) {
-        const int strong = v > 0 ? 0 : 1;
+    {
+        // knights get better the more pawns there are on the board, rooks get worse: they want open lines.
+        // Baseline is 5 own pawns
+        for (int c = 0; c < 2; ++c) {
+            const int delta = NumBitsOn(m_PieceMask[c * 6]) - 5;
+            const Score adj =
+                KnightPerPawn * (delta * NumBitsOn(m_PieceMask[c * 6 + 2])) +
+                RookPerPawn * (delta * NumBitsOn(m_PieceMask[c * 6 + 3]));
+
+            if (c == 0) total += adj;
+            else total -= adj;
+        }
+    }
+
+
+    // endgame scaling: some material advantages do not win. Only the endgame part of the score is scaled
+    int scale = 64;
+
+    if (total.eg != 0) {
+        const int strong = total.eg > 0 ? 0 : 1;
         const int weak = strong ^ 1;
 
-        int scale = 64;
+        const int strongPawns = NumBitsOn(m_PieceMask[strong * 6]);
+        const int weakPawns = NumBitsOn(m_PieceMask[weak * 6]);
+        const int npmDiff = NonPawnMaterial(m_PieceMask, strong) - NonPawnMaterial(m_PieceMask, weak);
 
-        if (
-            !m_PieceMask[strong * 6] &&
-            NonPawnMaterial(m_PieceMask, strong) - NonPawnMaterial(m_PieceMask, weak) < 400
-        ) {
+        if (!strongPawns && npmDiff < 400) {
             // no pawns to promote and less than a rook up: can't force mate
-            scale = m_PieceMask[weak * 6] ? 40 : 16;
+            scale = weakPawns ? ScaleNoPawnsWeakPawns : ScaleNoPawns;
         } else if (!((m_PieceMask[2] | m_PieceMask[8]) | (m_PieceMask[4] | m_PieceMask[10]))) {
-            // (only reached without knights and queens, which is all the bishop check below needs)
-            const int strongPawns = NumBitsOn(m_PieceMask[strong * 6]);
-            const int weakPawns = NumBitsOn(m_PieceMask[weak * 6]);
-
             const uint64_t sb = m_PieceMask[strong * 6 + 1];
             const uint64_t wb = m_PieceMask[weak * 6 + 1];
 
@@ -3120,13 +3457,39 @@ int Board::evaluate(PieceColor sideToMove, float endgameWeight) const noexcept {
                 strongRooks == weakRooks && strongRooks <= 1 &&
                 IsLightSquare(MaskToIndex(sb)) != IsLightSquare(MaskToIndex(wb))
             ) {
-                if (strongRooks == 0) scale = (strongPawns - weakPawns >= 3) ? 52 : 32;
-                else scale = 48;
+                if (strongRooks == 0) scale = (strongPawns - weakPawns >= 3) ? ScaleOcbLead : ScaleOcb;
+                else scale = ScaleOcbRooks;
             }
         }
 
-        v = v * scale / 64;
+        {
+            // fewer pawns means a smaller chance to convert, as long as the material lead is less than a rook
+            if (npmDiff < 400) scale = std::min(scale, ScaleBase + ScalePerPawn * strongPawns);
+
+            // wrong colored bishop with only rook pawns against a bare king in the corner is a draw
+            const uint64_t strongPawnMask = m_PieceMask[strong * 6];
+            const uint64_t sb = m_PieceMask[strong * 6 + 1];
+
+            if (
+                strongPawnMask && sb && !(sb & (sb - 1)) &&
+                !(m_PieceMask[strong * 6 + 2] | m_PieceMask[strong * 6 + 3] | m_PieceMask[strong * 6 + 4]) &&
+                !weakPawns && !NonPawnMaterial(m_PieceMask, weak) &&
+                (!(strongPawnMask & ~FileA) || !(strongPawnMask & ~FileH))
+            ) {
+                const int cornerFile = (strongPawnMask & FileA) ? 0 : (Files - 1);
+                const int queeningSq = (strong == 0 ? 0 : Ranks * (Ranks - 1)) + cornerFile;
+                const int weakKing = MaskToIndex(m_PieceMask[weak * 6 + 5]);
+
+                if (IsLightSquare(MaskToIndex(sb)) != IsLightSquare(queeningSq) && ChebDist(weakKing, queeningSq) <= 1) {
+                    scale = 0;
+                }
+            }
+        }
     }
+
+    // interpolate between middlegame and (scaled) endgame once
+    const int egScaled = total.eg * scale / 64;
+    int v = static_cast<int>(static_cast<float>(total.mg) + static_cast<float>(egScaled - total.mg) * endgameWeight);
 
     // when one side is clearly winning on material and the other has nothing to push, drive the
     // lone king to the edge / corner and bring our own king closer. Only for the winning side.
@@ -3167,7 +3530,7 @@ int Board::evaluate(PieceColor sideToMove, float endgameWeight) const noexcept {
         }
     }
 
-    return 15 + (whiteToMove ? v : -v); // tempo bonus for being the side to move
+    return Tempo + (whiteToMove ? v : -v); // tempo bonus for being the side to move
 }
 
 int Board::evaluate(PieceColor sideToMove) const noexcept {

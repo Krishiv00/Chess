@@ -70,10 +70,6 @@ namespace Chess {
         100, 275, 300, 350, 620, 0
     };
 
-    constexpr inline const uint16_t PieceEgValues[] = {
-        100, 400, 300, 600, 1000, 0
-    };
-
     struct Piece {
         Piece() = default;
         Piece(PieceType type, PieceColor color) : Type(type), Color(color) {}
@@ -231,12 +227,15 @@ namespace Chess {
     }
 
     class Board {
-    private:
-        // required to run tests
+    // define CHESS_TESTING in testing before including
+    #ifdef CHESS_EXPOSE_INTERNALS
     public:
+    #else
+    private:
+    #endif
         struct PinMasks {
             uint64_t Pinned{0};
-            uint64_t Rays[64]{0};
+            uint64_t Rays[64];
         };
 
         void scanPins(int kingPos, uint64_t pinners, uint64_t friendlyOcc, PinMasks& result) const;
@@ -296,6 +295,9 @@ namespace Chess {
         void getAllLegalMoves(PieceColor sideToMove, Move* out, unsigned int& moveCount) const;
         void getAllCaptureMoves(PieceColor sideToMove, Move* out, unsigned int& moveCount) const;
 
+        void getAllLegalMoves(PieceColor sideToMove, uint64_t checkMask, Move* out, unsigned int& moveCount) const;
+        void getAllCaptureMoves(PieceColor sideToMove, uint64_t checkMask, Move* out, unsigned int& moveCount) const;
+
         [[nodiscard]]
         unsigned int numPositions(int depth, PieceColor sideToMove);
 
@@ -333,6 +335,11 @@ namespace Chess {
         [[nodiscard]]
         int evaluateMove(Move move, PieceColor sideToMove, int depth, int alpha, int beta) const;
 
+        bool searchRoot(
+            Move* moves, unsigned int numMoves, PieceColor sideToMove, int depth,
+            Move& bestMove, int& bestScore, bool allowPartial
+        ) const;
+
         [[nodiscard]]
         bool isThreefoldRepetition(int ply) const;
 
@@ -350,6 +357,13 @@ namespace Chess {
 
         // Efficiency
         uint64_t m_PawnAndKingHash;
+        uint64_t m_ColorOcc[2];
+
+        int m_IncMg;
+        int m_IncEg;
+        int m_Phase;
+
+        void refreshDerivedState();
 
     public:
         void NewGame();
@@ -441,6 +455,16 @@ namespace Chess {
         [[nodiscard]]
         inline uint64_t GetPieceMask(int idx) const noexcept {
             return m_PieceMask[idx];
+        }
+
+        [[nodiscard]]
+        inline const uint64_t* GetPieceMasks() const noexcept {
+            return m_PieceMask;
+        }
+
+        [[nodiscard]]
+        inline uint64_t GetPawnAndKingHash() const noexcept {
+            return m_PawnAndKingHash;
         }
 
         [[nodiscard]]
