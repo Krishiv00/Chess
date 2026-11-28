@@ -4,7 +4,7 @@ int main() {
     Launcher launcher({
         .WindowSize = 800u,
         .Fps = 60u,
-        .WindowTitle = "Chess",
+        .WindowTitle = "Chess++",
         .WindowStyle = sf::Style::Default
     });
 

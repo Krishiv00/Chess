@@ -6,7 +6,9 @@ OUT_DIR := dist
 GUI_EXE := Chess++GUI.exe
 UCI_EXE := Chess++UCI.exe
 
-ICON_FILE := Resources/icon.ico
+ICON_PNG := Resources/icon.png
+ICON_PREBUILT := Resources/icon.ico
+ICON_FILE := icon.ico
 DIST_ASSETS := Resources
 
 SFML_INCLUDE := C:/SFML/include
@@ -46,9 +48,7 @@ ENGINE_REL_FLAGS := $(STD) $(ENGINE_INC) -fno-exceptions -O3 -DNDEBUG -ffunction
 GUI_DEV_LIBS := -L$(SFML_LIB) -lsfml-graphics -lsfml-window -lsfml-audio -lsfml-network -lsfml-system
 GUI_REL_LIBS := -L$(SFML_LIB) -lsfml-graphics-s -lsfml-window-s -lsfml-audio-s -lsfml-network-s -lsfml-system-s -lfreetype -lharfbuzz -lmbedtls -lmbedx509 -lmbedcrypto -lopengl32 -lgdi32 -lwinmm -lws2_32 -ldnsapi -lflac -lvorbisenc -lvorbisfile -lvorbis -logg -lpthread -lbcrypt -lcrypt32
 
-ifneq ($(wildcard $(ICON_FILE)),)
 RES_OBJ := $(BUILD_DIR)/resource.o
-endif
 
 .PHONY: all dev release gui uci release-gui release-uci clean FORCE copy-assets
 
@@ -80,52 +80,61 @@ $(OUT_DIR)/$(UCI_EXE): $(UCI_REL_OBJ) copy-assets
 
 $(BUILD_DIR)/dev/GUI/%.o: $(SRC_DIR)/GUI/%.cpp Makefile
 	@echo Compiling $<
-	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))"
+	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))" 2>nul & exit 0
 	@$(CXX) $(GUI_DEV_FLAGS) -c $< -o $@
 
 $(BUILD_DIR)/release/GUI/%.o: $(SRC_DIR)/GUI/%.cpp FORCE
 	@echo Compiling $<
-	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))"
+	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))" 2>nul & exit 0
 	@$(CXX) $(GUI_REL_FLAGS) -c $< -o $@
 
 $(BUILD_DIR)/dev/UCI/%.o: $(SRC_DIR)/UCI/%.cpp Makefile
 	@echo Compiling $<
-	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))"
+	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))" 2>nul & exit 0
 	@$(CXX) $(UCI_DEV_FLAGS) -c $< -o $@
 
 $(BUILD_DIR)/release/UCI/%.o: $(SRC_DIR)/UCI/%.cpp FORCE
 	@echo Compiling $<
-	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))"
+	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))" 2>nul & exit 0
 	@$(CXX) $(UCI_REL_FLAGS) -c $< -o $@
 
 $(BUILD_DIR)/dev/Engine/%.o: $(SRC_DIR)/Engine/%.cpp Makefile
 	@echo Compiling $<
-	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))"
+	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))" 2>nul & exit 0
 	@$(CXX) $(ENGINE_DEV_FLAGS) -c $< -o $@
 
 $(BUILD_DIR)/release/Engine/%.o: $(SRC_DIR)/Engine/%.cpp FORCE
 	@echo Compiling $<
-	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))"
+	@if not exist "$(subst /,\,$(@D))" mkdir "$(subst /,\,$(@D))" 2>nul & exit 0
 	@$(CXX) $(ENGINE_REL_FLAGS) -c $< -o $@
 
-ifneq ($(wildcard $(ICON_FILE)),)
-$(RES_OBJ): $(ICON_FILE)
-	@echo Compiling $(ICON_FILE)
-	@if not exist "$(BUILD_DIR)" mkdir "$(BUILD_DIR)"
+$(RES_OBJ): $(ICON_PNG)
+ifneq ($(wildcard $(ICON_PREBUILT)),)
+	@if not exist "$(BUILD_DIR)" mkdir "$(BUILD_DIR)" 2>nul & exit 0
+	@echo IDI_ICON1 ICON "$(ICON_PREBUILT)" > resource.rc
+	@windres resource.rc -o $@
+	@del /Q resource.rc
+else
+	@if not exist "$(BUILD_DIR)" mkdir "$(BUILD_DIR)" 2>nul & exit 0
+	@ffmpeg -y -loglevel error -i "$(ICON_PNG)" -vf scale=256:256:flags=lanczos -frames:v 1 -c:v png "$(ICON_FILE)"
 	@echo IDI_ICON1 ICON "$(ICON_FILE)" > resource.rc
 	@windres resource.rc -o $@
 	@del /Q resource.rc
+	@del /Q "$(ICON_FILE)"
 endif
 
 copy-assets:
 	@if not exist "$(OUT_DIR)" mkdir "$(OUT_DIR)"
-	@if exist "$(DIST_ASSETS)\" (xcopy "$(DIST_ASSETS)" "$(OUT_DIR)\$(DIST_ASSETS)" /E /I /Y /Q >nul) else (copy /Y "$(DIST_ASSETS)" "$(OUT_DIR)" >nul)
+	@if exist "$(DIST_ASSETS)\" (echo icon.ico> xcopy_exclude.txt && xcopy "$(DIST_ASSETS)" "$(OUT_DIR)\$(DIST_ASSETS)" /E /I /Y /Q /EXCLUDE:xcopy_exclude.txt >nul && del /Q xcopy_exclude.txt) else (copy /Y "$(DIST_ASSETS)" "$(OUT_DIR)" >nul)
 
 FORCE:
 
 clean:
-	@echo Cleaning $(BUILD_DIR)/ and $(OUT_DIR)/
+	@echo Cleaning Up!
 	@if exist "$(BUILD_DIR)" rmdir /S /Q "$(BUILD_DIR)"
 	@if exist "$(OUT_DIR)" rmdir /S /Q "$(OUT_DIR)"
+	@if exist "$(ICON_FILE)" del /Q "$(ICON_FILE)"
+	@if exist resource.rc del /Q resource.rc
+	@if exist xcopy_exclude.txt del /Q xcopy_exclude.txt
 
 -include $(GUI_DEV_OBJ:.o=.d) $(UCI_DEV_OBJ:.o=.d) $(GUI_REL_OBJ:.o=.d) $(UCI_REL_OBJ:.o=.d)

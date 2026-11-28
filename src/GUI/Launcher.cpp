@@ -214,6 +214,8 @@ bool Launcher::LoadResources(const std::filesystem::path& root) {
         return false;
     }
 
+    m_Window.setIcon(sf::Image(root / "icon.png"));
+
     return true;
 }
 

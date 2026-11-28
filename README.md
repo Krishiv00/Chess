@@ -259,6 +259,8 @@ The repo ships a `Makefile` (MinGW/Windows) that builds both executables, with s
 
 Set `SFML_INCLUDE` and `SFML_LIB` at the top of the Makefile to point at your local SFML install.
 
+If your system doesn't have ffmpeg in PATH, you'll have to manually convert `Resources/icon.png` to .ico for the GUI.exe's icon.
+
 ---
 
 # Testing
